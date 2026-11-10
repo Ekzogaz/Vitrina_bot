@@ -7,6 +7,8 @@ import threading
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup  # <-- Вот этот импорт был нужен
 from aiogram.types import (
     KeyboardButton,
     Message,
@@ -25,7 +27,6 @@ user_settings = {}
 
 
 # --- ВСТРОЕННЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
-# Он нужен только для того, чтобы Render видел открытый порт и не ругался таймаутом
 def run_dummy_web_server():
   port = int(os.environ.get("PORT", 10000))
 
@@ -37,15 +38,12 @@ def run_dummy_web_server():
       self.wfile.write(b"Bot is alive and running!")
 
     def log_message(self, format, *args):
-      pass  # Отключаем лишний спам в логах от пинг-запросов Render
+      pass
 
   server_address = ("0.0.0.0", port)
   httpd = http.server.HTTPServer(server_address, HealthCheckHandler)
   print(f"Веб-заглушка запущена на порту {port}")
   httpd.serve_forever()
-
-
-# ----------------------------------------
 
 
 # Состояния для ввода через интерактивный диалог по кнопкам
@@ -290,7 +288,6 @@ async def handle_photos(message: Message):
 
 
 async def main():
-  # Запускаем веб-заглушку в отдельном фоновом потоке, чтобы Render видел открытый порт
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
 
   await bot.delete_webhook(drop_pending_updates=True)
