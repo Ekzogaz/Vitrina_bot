@@ -4,7 +4,14 @@ import re
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 # Токен вашего бота
 TOKEN = "9085949690:AAGAQLcj2ZBEG0FU1tqcHT6SZBm73w-gHtk"
@@ -16,32 +23,47 @@ dp = Dispatcher()
 user_settings = {}
 
 
-def escape_markdown(text: str) -> str:
-  """Экранирует спецсимволы Markdown, чтобы Telegram не выдавал ошибку парсинга."""
-  if not text:
-    return ""
-  # Убираем или экранируем символы, которые ломают разметку Telegram
-  escape_chars = r"_*[]()~`>#+-=|{}.!"
-  return re.sub(
-      f"([{re.escape(escape_chars)}])", r"\\\1", text
+# Состояния для ввода через интерактивный диалог по кнопкам
+class AdminStates(StatesGroup):
+  waiting_for_custom_promo = State()
+  waiting_for_custom_discount = State()
+
+
+# Главная клавиатура с кнопками управления
+def get_main_keyboard():
+  keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="💎 Pre-Black Friday (-6%)"),
+            KeyboardButton(text="🔥 Розпродаж (-10%)",),
+        ],
+        [
+            KeyboardButton(text="✍️ Ввести свій текст акції"),
+            KeyboardButton(text="🔢 Ввести свій % знижки"),
+        ],
+        [
+            KeyboardButton(text="⚙️ Поточні налаштування"),
+        ],
+    ],
+    resize_keyboard=True,
   )
+  return keyboard
 
 
-# Функция расчета цены
 def apply_auction_logic(
     text: str, promo_header: str, discount_percent: float
 ) -> str:
   if not text:
     text = ""
 
-  # Паттерн для поиска цены (поддерживает пробелы между тысячами вроде "4 143")
+  # Паттерн для поиска цены (поддерживает пробелы между тысячами вроде "8 572")
   pattern = r"(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.)"
-  calculated_price_str = ""
-  original_price_matched = ""
+  price_found = False
 
   def replace_price(match):
-    nonlocal calculated_price_str, original_price_matched
-    original_price_matched = match.group(0)
+    nonlocal price_found
+    price_found = True
+    original_price_str = match.group(0)
     raw_number = match.group(1).replace(" ", "").replace(",", ".")
     currency = match.group(2)
     try:
@@ -50,120 +72,167 @@ def apply_auction_logic(
       new_price_formatted = (
           int(new_price) if new_price.is_integer() else round(new_price, 2)
       )
-      calculated_price_str = (
-          f"\n\n🔥 **Акційна ціна: {new_price_formatted} {currency}**"
+      return (
+          f"~~{original_price_str}~~"
+          f"\n🔥 **Акційна ціна: {new_price_formatted} {currency}**"
           f" (-{discount_percent}%)"
       )
-      return f"~~{original_price_matched}~~"
     except ValueError:
-      return match.group(0)
+      return original_price_str
 
-  # Заменяем цену на зачеркнутую в тексте
   updated_text = re.sub(pattern, replace_price, text, count=1, flags=re.IGNORECASE)
 
-  # Если оригинальный текст содержал потенциально опасные символы, очищаем его
-  # Оставляем только базовый текст, а акционную шапку и цену рендерим безопасно через Markdown
-  clean_text = text
+  if not price_found:
+    updated_text += f"\n\n🔥 **Акційна знижка: -{discount_percent}%**"
 
-  if calculated_price_str:
-    # Аккуратно добавляем акционную цену ниже зачеркнутой старой
-    clean_text = re.sub(
-        pattern,
-        lambda m: f"~~{m.group(0)}~~" + calculated_price_str,
-        text,
-        count=1,
-        flags=re.IGNORECASE,
-    )
-  else:
-    clean_text += f"\n\n🔥 **Акційна знижка: -{discount_percent}%**"
-
-  # Собираем итоговое сообщение
-  return f"🚨 **{promo_header}** 🚨\n\n{clean_text}"
+  return f"🚨 **{promo_header}** 🚨\n\n{updated_text}"
 
 
 # Команда /start
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+  await state.clear()
   user_id = message.from_user.id
   if user_id not in user_settings:
     user_settings[user_id] = {
-        "promo": "АКЦІЯ НА ТОВАР!",
-        "discount": 5.0,
+        "promo": "Ювелірна Pre-Black Friday",
+        "discount": 6.0,
     }
 
   settings = user_settings[user_id]
   await message.answer(
       "Привіт! 👋\n\n"
-      "Бот налаштований на пакетну обробку фото.\n"
-      f"Поточні налаштування:\n"
-      f"• Текст акції: *{settings['promo']}*\n"
+      "Я бот для пакетної обробки фото товарів зі знижками.\n"
+      f"📋 **Поточні налаштування:**\n"
+      f"• Акція: *{settings['promo']}*\n"
       f"• Знижка: *{settings['discount']}%*\n\n"
-      "⚙️ **Як змінити налаштування:**\n"
-      "• Текст: `/promo Ваш текст акції`\n"
-      "• Знижка: `/discount 10`\n\n"
-      "📸 Можете надсилати фото (одиночні або пачками)!",
+      "Оберіть дію на клавіатурі нижче або просто **кидайте пачку фото** с товарами!",
+      reply_markup=get_main_keyboard(),
       parse_mode=ParseMode.MARKDOWN,
   )
 
 
-# Смена текста акции: /promo Новый текст
-@dp.message(Command("promo"))
-async def set_promo(message: Message):
+# Обработка нажатий на кнопки меню
+@dp.message(
+    F.text.in_({
+        "💎 Pre-Black Friday (-6%)",
+        "🔥 Розпродаж (-10%)",
+        "✍️ Ввести свій текст акції",
+        "🔢 Ввести свій % знижки",
+        "⚙️ Поточні налаштування",
+    })
+)
+async def handle_menu_buttons(message: Message, state: FSMContext):
   user_id = message.from_user.id
-  args = message.text.split(maxsplit=1)
+  text = message.text
 
-  if len(args) < 2:
+  if user_id not in user_settings:
+    user_settings[user_id] = {
+        "promo": "Ювелірна Pre-Black Friday",
+        "discount": 6.0,
+    }
+
+  if text == "💎 Pre-Black Friday (-6%)":
+    user_settings[user_id]["promo"] = "Ювелірна Pre-Black Friday"
+    user_settings[user_id]["discount"] = 6.0
     await message.answer(
-        "❌ Вкажіть текст після команди.\nПриклад: `/promo РОЗПРОДАЖ КОЛЕКЦІЇ`",
+        "✅ Успішно встановлено:\n• Акція: *Ювелірна Pre-Black"
+        " Friday*\n• Знижка: *6%*",
+        reply_markup=get_main_keyboard(),
         parse_mode=ParseMode.MARKDOWN,
     )
-    return
 
-  new_promo = args[1]
+  elif text == "🔥 Розпродаж (-10%)":
+    user_settings[user_id]["promo"] = "ГАВЯЧИЙ РОЗПРОДАЖ КОЛЕКЦІЇ"
+    user_settings[user_id]["discount"] = 10.0
+    await message.answer(
+        "✅ Успішно встановлено:\n• Акція: *ГАВЯЧИЙ РОЗПРОДАЖ"
+        " КОЛЕКЦІЇ*\n• Знижка: *10%*",
+        reply_markup=get_main_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+  elif text == "✍️ Ввести свій текст акції":
+    await state.set_state(AdminStates.waiting_for_custom_promo)
+    await message.answer(
+        "✍️ Надішліть текстом новий заголовок для вашої акції:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+  elif text == "🔢 Ввести свій % знижки":
+    await state.set_state(AdminStates.waiting_for_custom_discount)
+    await message.answer(
+        "🔢 Введіть числом бажаний відсоток знижки (наприклад: `7.5` або `15`):",
+        reply_markup=ReplyKeyboardRemove(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+  elif text == "⚙️ Поточні налаштування":
+    settings = user_settings[user_id]
+    await message.answer(
+        f"📋 **Поточні налаштування:**\n"
+        f"• Акція: *{settings['promo']}*\n"
+        f"• Знижка: *{settings['discount']}%*",
+        reply_markup=get_main_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# Шаг: сохранение своего текста акции, введенного пользователем
+@dp.message(AdminStates.waiting_for_custom_promo, F.text)
+async def save_custom_promo(message: Message, state: FSMContext):
+  user_id = message.from_user.id
+  new_promo = message.text.strip()
+
   if user_id not in user_settings:
-    user_settings[user_id] = {"promo": new_promo, "discount": 5.0}
+    user_settings[user_id] = {"promo": new_promo, "discount": 6.0}
   else:
     user_settings[user_id]["promo"] = new_promo
 
+  await state.clear()
   await message.answer(
-      f"✅ Текст акції змінено на:\n*{new_promo}*", parse_mode=ParseMode.MARKDOWN
+      f"✅ Текст акції змінено на:\n*{new_promo}*",
+      reply_markup=get_main_keyboard(),
+      parse_mode=ParseMode.MARKDOWN,
   )
 
 
-# Смена скидки: /discount 10
-@dp.message(Command("discount"))
-async def set_discount(message: Message):
+# Шаг: сохранение своей скидки, введенной пользователем
+@dp.message(AdminStates.waiting_for_custom_discount, F.text)
+async def save_custom_discount(message: Message, state: FSMContext):
   user_id = message.from_user.id
-  args = message.text.split(maxsplit=1)
+  text_input = message.text.strip().replace(",", ".")
 
-  if len(args) < 2:
+  try:
+    new_discount = float(text_input)
+  except ValueError:
     await message.answer(
-        "❌ Вкажіть число.\nПриклад: `/discount 7.5`", parse_mode=ParseMode.MARKDOWN
+        "❌ Помилка! Введіть лише число (наприклад: `7` або `12.5`):"
     )
     return
 
-  try:
-    new_discount = float(args[1].replace(",", "."))
-  except ValueError:
-    await message.answer("❌ Помилка! Введіть число (наприклад: `5` або `10`.)")
-    return
-
   if user_id not in user_settings:
-    user_settings[user_id] = {"promo": "АКЦІЯ НА ТОВАР!", "discount": new_discount}
+    user_settings[user_id] = {
+        "promo": "Ювелірна Pre-Black Friday",
+        "discount": new_discount,
+    }
   else:
     user_settings[user_id]["discount"] = new_discount
 
+  await state.clear()
   await message.answer(
-      f"✅ Знижку змінено на: *{new_discount}%*", parse_mode=ParseMode.MARKDOWN
+      f"✅ Розмір знижки змінено на: *{new_discount}%*",
+      reply_markup=get_main_keyboard(),
+      parse_mode=ParseMode.MARKDOWN,
   )
 
 
-# Обработчик фотографий
+# Обработчик фотографий (работает и с пачками, и с одиночными фото)
 @dp.message(F.photo)
 async def handle_photos(message: Message):
   user_id = message.from_user.id
   settings = user_settings.get(
-      user_id, {"promo": "АКЦІЯ НА ТОВАР!", "discount": 5.0}
+      user_id, {"promo": "Ювелірна Pre-Black Friday", "discount": 6.0}
   )
 
   promo_text = settings["promo"]
@@ -181,22 +250,23 @@ async def handle_photos(message: Message):
         photo=photo_id,
         caption=new_caption,
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_main_keyboard(),
     )
   except Exception as e:
-    # Если парсер всё же упал, отправляем без Markdown-разметки описания, чтобы фото не терялось
-    logging.error(f"Markdown error: {e}")
-    plain_caption = (
-        f"🚨 {promo_text} 🚨\n\n{original_caption}\n\n🔥 Акція: -{discount_percent}%"
-    )
+    logging.error(f"Markdown parse error: {e}")
+    plain_caption = f"🚨 {promo_text} 🚨\n\n{original_caption}\n\n🔥 Акція: -{discount_percent}%"
     await bot.send_photo(
-        chat_id=message.from_user.id, photo=photo_id, caption=plain_caption
+        chat_id=message.from_user.id,
+        photo=photo_id,
+        caption=plain_caption,
+        reply_markup=get_main_keyboard(),
     )
 
 
 async def main():
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен и готов к работе...")
+  print("Бот запущен с удобным кнопочным меню...")
   await dp.start_polling(bot)
 
 
