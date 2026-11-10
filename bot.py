@@ -12,9 +12,19 @@ TOKEN = "9085949690:AAGAQLcj2ZBEG0FU1tqcHT6SZBm73w-gHtk"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Словарь для хранения настроек пользователей (текст акции и скидка по умолчанию)
-# Ключ — ID пользователя, значение — словарь с настройками
+# Словарь для хранения настроек пользователей
 user_settings = {}
+
+
+def escape_markdown(text: str) -> str:
+  """Экранирует спецсимволы Markdown, чтобы Telegram не выдавал ошибку парсинга."""
+  if not text:
+    return ""
+  # Убираем или экранируем символы, которые ломают разметку Telegram
+  escape_chars = r"_*[]()~`>#+-=|{}.!"
+  return re.sub(
+      f"([{re.escape(escape_chars)}])", r"\\\1", text
+  )
 
 
 # Функция расчета цены
@@ -27,9 +37,11 @@ def apply_auction_logic(
   # Паттерн для поиска цены (поддерживает пробелы между тысячами вроде "4 143")
   pattern = r"(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.)"
   calculated_price_str = ""
+  original_price_matched = ""
 
   def replace_price(match):
-    nonlocal calculated_price_str
+    nonlocal calculated_price_str, original_price_matched
+    original_price_matched = match.group(0)
     raw_number = match.group(1).replace(" ", "").replace(",", ".")
     currency = match.group(2)
     try:
@@ -42,23 +54,37 @@ def apply_auction_logic(
           f"\n\n🔥 **Акційна ціна: {new_price_formatted} {currency}**"
           f" (-{discount_percent}%)"
       )
-      return f"~~{match.group(0)}~~{calculated_price_str}"
+      return f"~~{original_price_matched}~~"
     except ValueError:
       return match.group(0)
 
+  # Заменяем цену на зачеркнутую в тексте
   updated_text = re.sub(pattern, replace_price, text, count=1, flags=re.IGNORECASE)
 
-  if not calculated_price_str:
-    updated_text += f"\n\n🔥 **Акційна знижка: -{discount_percent}%**"
+  # Если оригинальный текст содержал потенциально опасные символы, очищаем его
+  # Оставляем только базовый текст, а акционную шапку и цену рендерим безопасно через Markdown
+  clean_text = text
 
-  return f"🚨 **{promo_header}** 🚨\n\n{updated_text}"
+  if calculated_price_str:
+    # Аккуратно добавляем акционную цену ниже зачеркнутой старой
+    clean_text = re.sub(
+        pattern,
+        lambda m: f"~~{m.group(0)}~~" + calculated_price_str,
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+  else:
+    clean_text += f"\n\n🔥 **Акційна знижка: -{discount_percent}%**"
+
+  # Собираем итоговое сообщение
+  return f"🚨 **{promo_header}** 🚨\n\n{clean_text}"
 
 
 # Команда /start
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
   user_id = message.from_user.id
-  # Устанавливаем настройки по умолчанию, если их еще нет
   if user_id not in user_settings:
     user_settings[user_id] = {
         "promo": "АКЦІЯ НА ТОВАР!",
@@ -68,20 +94,19 @@ async def cmd_start(message: Message):
   settings = user_settings[user_id]
   await message.answer(
       "Привіт! 👋\n\n"
-      "Бот налаштований на **пакетну обробку фото**.\n"
+      "Бот налаштований на пакетну обробку фото.\n"
       f"Поточні налаштування:\n"
       f"• Текст акції: *{settings['promo']}*\n"
       f"• Знижка: *{settings['discount']}%*\n\n"
       "⚙️ **Як змінити налаштування:**\n"
-      "• Щоб змінити текст: `/promo Ваш текст акції`\n"
-      "• Щоб змінити знижку: `/discount 10` (або інший відсоток)\n\n"
-      "📸 Після цього просто **кидайте пачку фото (до 10 штук за раз)**, і бот"
-      " все обробить!",
+      "• Текст: `/promo Ваш текст акції`\n"
+      "• Знижка: `/discount 10`\n\n"
+      "📸 Можете надсилати фото (одиночні або пачками)!",
       parse_mode=ParseMode.MARKDOWN,
   )
 
 
-# Команда для смены текста акции: /promo Новый текст
+# Смена текста акции: /promo Новый текст
 @dp.message(Command("promo"))
 async def set_promo(message: Message):
   user_id = message.from_user.id
@@ -89,8 +114,7 @@ async def set_promo(message: Message):
 
   if len(args) < 2:
     await message.answer(
-        "❌ Будь ласка, вкажіть текст після команди.\nПриклад:"
-        " `/promo РОЗПРОДАЖ КОЛЕКЦІЇ`",
+        "❌ Вкажіть текст після команди.\nПриклад: `/promo РОЗПРОДАЖ КОЛЕКЦІЇ`",
         parse_mode=ParseMode.MARKDOWN,
     )
     return
@@ -102,12 +126,11 @@ async def set_promo(message: Message):
     user_settings[user_id]["promo"] = new_promo
 
   await message.answer(
-      f"✅ Текст акції успішно змінено на:\n*{new_promo}*",
-      parse_mode=ParseMode.MARKDOWN,
+      f"✅ Текст акції змінено на:\n*{new_promo}*", parse_mode=ParseMode.MARKDOWN
   )
 
 
-# Команда для смены скидки: /discount 10
+# Смена скидки: /discount 10
 @dp.message(Command("discount"))
 async def set_discount(message: Message):
   user_id = message.from_user.id
@@ -115,15 +138,14 @@ async def set_discount(message: Message):
 
   if len(args) < 2:
     await message.answer(
-        "❌ Будь ласка, вкажіть число.\nПриклад: `/discount 7.5`",
-        parse_mode=ParseMode.MARKDOWN,
+        "❌ Вкажіть число.\nПриклад: `/discount 7.5`", parse_mode=ParseMode.MARKDOWN
     )
     return
 
   try:
     new_discount = float(args[1].replace(",", "."))
   except ValueError:
-    await message.answer("❌ Помилка! Введіть число (наприклад: `5` або `10`).")
+    await message.answer("❌ Помилка! Введіть число (наприклад: `5` або `10`.)")
     return
 
   if user_id not in user_settings:
@@ -132,17 +154,14 @@ async def set_discount(message: Message):
     user_settings[user_id]["discount"] = new_discount
 
   await message.answer(
-      f"✅ Розмір знижки успішно змінено на: *{new_discount}%*",
-      parse_mode=ParseMode.MARKDOWN,
+      f"✅ Знижку змінено на: *{new_discount}%*", parse_mode=ParseMode.MARKDOWN
   )
 
 
-# Обработчик фотографий (работает как с одиночными фото, так и с пачками/альбомами)
+# Обработчик фотографий
 @dp.message(F.photo)
 async def handle_photos(message: Message):
   user_id = message.from_user.id
-
-  # Берем настройки пользователя или дефолтные
   settings = user_settings.get(
       user_id, {"promo": "АКЦІЯ НА ТОВАР!", "discount": 5.0}
   )
@@ -156,19 +175,28 @@ async def handle_photos(message: Message):
   )
   photo_id = message.photo[-1].file_id
 
-  # Отправляем обработанное фото
-  await bot.send_photo(
-      chat_id=message.from_user.id,
-      photo=photo_id,
-      caption=new_caption,
-      parse_mode=ParseMode.MARKDOWN,
-  )
+  try:
+    await bot.send_photo(
+        chat_id=message.from_user.id,
+        photo=photo_id,
+        caption=new_caption,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+  except Exception as e:
+    # Если парсер всё же упал, отправляем без Markdown-разметки описания, чтобы фото не терялось
+    logging.error(f"Markdown error: {e}")
+    plain_caption = (
+        f"🚨 {promo_text} 🚨\n\n{original_caption}\n\n🔥 Акція: -{discount_percent}%"
+    )
+    await bot.send_photo(
+        chat_id=message.from_user.id, photo=photo_id, caption=plain_caption
+    )
 
 
 async def main():
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен в режиме пакетной обработки...")
+  print("Бот запущен и готов к работе...")
   await dp.start_polling(bot)
 
 
