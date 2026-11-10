@@ -52,14 +52,10 @@ class AdminStates(StatesGroup):
   waiting_for_custom_discount = State()
 
 
-# Главная клавиатура с кнопками управления
+# Упрощенная клавиатура
 def get_main_keyboard():
   keyboard = ReplyKeyboardMarkup(
       keyboard=[
-          [
-              KeyboardButton(text="💎 Pre-Black Friday (-6%)"),
-              KeyboardButton(text="🔥 Розпродаж (-10%)"),
-          ],
           [
               KeyboardButton(text="✍️ Ввести свій текст акції"),
               KeyboardButton(text="🔢 Ввести свій % знижки"),
@@ -73,7 +69,7 @@ def get_main_keyboard():
   return keyboard
 
 
-# Безопасная функция формирования текста БЕЗ капризного Markdown
+# Функция формирования текста: округление до целых и без процента в скобках
 def apply_auction_logic(
     text: str, promo_header: str, discount_percent: float
 ) -> str:
@@ -96,18 +92,16 @@ def apply_auction_logic(
 
       price_found = True
       new_price = price * (1 - discount_percent / 100)
-      new_price_formatted = (
-          int(new_price) if new_price.is_integer() else round(new_price, 2)
-      )
+      # Округляем до ближайшего целого числа (без знаков после запятой)
+      new_price_formatted = round(new_price)
 
       currency = match.group(3) or "грн"
       original_full = match.group(0)
 
-      # Без спецсимволов Markdown, чтобы Telegram не выдавал ошибок
+      # Убрали процент в скобках, оставили только чистую акционную цену
       return (
           f"~~{original_full}~~"
-          f"\n🔥 Акційна ціна: {new_price_formatted} {currency}"
-          f" (-{discount_percent}%)"
+          f"\n\n🔥 Акційна ціна: {new_price_formatted} {currency}"
       )
     except ValueError:
       return match.group(0)
@@ -115,9 +109,7 @@ def apply_auction_logic(
   updated_text = re.sub(pattern, replace_price, text, count=1, flags=re.IGNORECASE)
 
   if not price_found:
-    updated_text += (
-        f"\n\n🔥 Акційна ціна зі знижкою -{discount_percent}%"
-    )
+    updated_text += f"\n\n🔥 Акційна ціна зі знижкою -{discount_percent}%"
 
   return f"🚨 {promo_header} 🚨\n\n{updated_text}"
 
@@ -129,8 +121,8 @@ async def cmd_start(message: Message, state: FSMContext):
   user_id = message.from_user.id
   if user_id not in user_settings:
     user_settings[user_id] = {
-        "promo": "Ювелірна Pre-Black Friday",
-        "discount": 6.0,
+        "promo": "АКЦІЙНА ПРОПОЗИЦІЯ",
+        "discount": 5.0,
     }
 
   settings = user_settings[user_id]
@@ -149,8 +141,6 @@ async def cmd_start(message: Message, state: FSMContext):
 # Обработка нажатий на кнопки меню
 @dp.message(
     F.text.in_({
-        "💎 Pre-Black Friday (-6%)",
-        "🔥 Розпродаж (-10%)",
         "✍️ Ввести свій текст акції",
         "🔢 Ввести свій % знижки",
         "⚙️ Поточні налаштування",
@@ -162,29 +152,11 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
 
   if user_id not in user_settings:
     user_settings[user_id] = {
-        "promo": "Ювелірна Pre-Black Friday",
-        "discount": 6.0,
+        "promo": "АКЦІЙНА ПРОПОЗИЦІЯ",
+        "discount": 5.0,
     }
 
-  if text == "💎 Pre-Black Friday (-6%)":
-    user_settings[user_id]["promo"] = "Ювелірна Pre-Black Friday"
-    user_settings[user_id]["discount"] = 6.0
-    await message.answer(
-        "✅ Успішно встановлено:\n• Акція: Ювелірна Pre-Black"
-        " Friday\n• Знижка: 6%",
-        reply_markup=get_main_keyboard(),
-    )
-
-  elif text == "🔥 Розпродаж (-10%)":
-    user_settings[user_id]["promo"] = "ГАряЧИЙ РОЗПРОДАЖ КОЛЕКЦІЇ"
-    user_settings[user_id]["discount"] = 10.0
-    await message.answer(
-        "✅ Успішно встановлено:\n• Акція: ГАряЧИЙ РОЗПРОДАЖ"
-        " КОЛЕКЦІЇ\n• Знижка: 10%",
-        reply_markup=get_main_keyboard(),
-    )
-
-  elif text == "✍️ Ввести свій текст акції":
+  if text == "✍️ Ввести свій текст акції":
     await state.set_state(AdminStates.waiting_for_custom_promo)
     await message.answer(
         "✍️ Надішліть текстом новий заголовок для вашої акції:",
@@ -194,7 +166,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
   elif text == "🔢 Ввести свій % знижки":
     await state.set_state(AdminStates.waiting_for_custom_discount)
     await message.answer(
-        "🔢 Введіть числом бажаний відсоток знижки (наприклад: 7.5 або 15):",
+        "🔢 Введіть числом бажаний відсоток знижки (наприклад: 7.5 або 12):",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -215,7 +187,7 @@ async def save_custom_promo(message: Message, state: FSMContext):
   new_promo = message.text.strip()
 
   if user_id not in user_settings:
-    user_settings[user_id] = {"promo": new_promo, "discount": 6.0}
+    user_settings[user_id] = {"promo": new_promo, "discount": 5.0}
   else:
     user_settings[user_id]["promo"] = new_promo
 
@@ -242,7 +214,7 @@ async def save_custom_discount(message: Message, state: FSMContext):
 
   if user_id not in user_settings:
     user_settings[user_id] = {
-        "promo": "Ювелірна Pre-Black Friday",
+        "promo": "АКЦІЙНА ПРОПОЗИЦІЯ",
         "discount": new_discount,
     }
   else:
@@ -260,7 +232,7 @@ async def save_custom_discount(message: Message, state: FSMContext):
 async def handle_photos(message: Message):
   user_id = message.from_user.id
   settings = user_settings.get(
-      user_id, {"promo": "Ювелірна Pre-Black Friday", "discount": 6.0}
+      user_id, {"promo": "АКЦІЙНА ПРОПОЗИЦІЯ", "discount": 5.0}
   )
 
   promo_text = settings["promo"]
@@ -272,7 +244,6 @@ async def handle_photos(message: Message):
   )
   photo_id = message.photo[-1].file_id
 
-  # Отправляем фото в чистом тексте без parse_mode, чтобы избежать любых ошибок Telegram
   await bot.send_photo(
       chat_id=message.from_user.id,
       photo=photo_id,
@@ -286,7 +257,7 @@ async def main():
 
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с безопасным форматированием текста...")
+  print("Бот запущен с округлением цен и компактным меню...")
   await dp.start_polling(bot)
 
 
