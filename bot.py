@@ -73,16 +73,16 @@ def get_main_keyboard():
   return keyboard
 
 
-# Сверхгибкая функция расчета цены и формирования текста
+# Универсальная функция расчета цены и формирования текста
 def apply_auction_logic(
     text: str, promo_header: str, discount_percent: float
 ) -> str:
   if not text:
     text = ""
 
-  # Паттерн ищет слово "Ціна" (необязательно) и число с пробелами тысяч перед валютой
+  # Усовершенствованный паттерн: надежно находит слово "Ціна" и число с пробелами тысяч
   pattern = (
-      r"(Ціна[:\s]*)?(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.|грнн)?\b"
+      r"(Ціна\s*:?\s*)(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.|грнн)?\b"
   )
   price_found = False
 
@@ -100,7 +100,6 @@ def apply_auction_logic(
           int(new_price) if new_price.is_integer() else round(new_price, 2)
       )
 
-      prefix = match.group(1) or "Ціна: "
       currency = match.group(3) or "грн"
       original_full = match.group(0)
 
