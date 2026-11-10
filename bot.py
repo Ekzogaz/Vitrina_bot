@@ -73,14 +73,14 @@ def get_main_keyboard():
   return keyboard
 
 
-# Универсальная функция расчета цены и формирования текста
+# Безопасная функция формирования текста БЕЗ капризного Markdown
 def apply_auction_logic(
     text: str, promo_header: str, discount_percent: float
 ) -> str:
   if not text:
     text = ""
 
-  # Усовершенствованный паттерн: надежно находит слово "Ціна" и число с пробелами тысяч
+  # Паттерн для поиска цены (например, "Ціна 8 572 грн")
   pattern = (
       r"(Ціна\s*:?\s*)(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.|грнн)?\b"
   )
@@ -103,9 +103,10 @@ def apply_auction_logic(
       currency = match.group(3) or "грн"
       original_full = match.group(0)
 
+      # Без спецсимволов Markdown, чтобы Telegram не выдавал ошибок
       return (
           f"~~{original_full}~~"
-          f"\n🔥 **Акційна ціна: {new_price_formatted} {currency}**"
+          f"\n🔥 Акційна ціна: {new_price_formatted} {currency}"
           f" (-{discount_percent}%)"
       )
     except ValueError:
@@ -115,10 +116,10 @@ def apply_auction_logic(
 
   if not price_found:
     updated_text += (
-        f"\n\n🔥 **Акційна ціна зі знижкою -{discount_percent}%**"
+        f"\n\n🔥 Акційна ціна зі знижкою -{discount_percent}%"
     )
 
-  return f"🚨 **{promo_header}** 🚨\n\n{updated_text}"
+  return f"🚨 {promo_header} 🚨\n\n{updated_text}"
 
 
 # Команда /start
@@ -136,13 +137,12 @@ async def cmd_start(message: Message, state: FSMContext):
   await message.answer(
       "Привіт! 👋\n\n"
       "Я бот для пакетної обробки фото товарів зі знижками.\n"
-      f"📋 **Поточні налаштування:**\n"
-      f"• Акція: *{settings['promo']}*\n"
-      f"• Знижка: *{settings['discount']}%*\n\n"
-      "Оберіть дію на клавіатурі нижче або просто **кидайте пачку фото** з"
+      f"📋 Поточні налаштування:\n"
+      f"• Акція: {settings['promo']}\n"
+      f"• Знижка: {settings['discount']}%\n\n"
+      "Оберіть дію на клавіатурі нижче або просто кидайте пачку фото з"
       " товарами!",
       reply_markup=get_main_keyboard(),
-      parse_mode=ParseMode.MARKDOWN,
   )
 
 
@@ -170,20 +170,18 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     user_settings[user_id]["promo"] = "Ювелірна Pre-Black Friday"
     user_settings[user_id]["discount"] = 6.0
     await message.answer(
-        "✅ Успішно встановлено:\n• Акція: *Ювелірна Pre-Black"
-        " Friday*\n• Знижка: *6%*",
+        "✅ Успішно встановлено:\n• Акція: Ювелірна Pre-Black"
+        " Friday\n• Знижка: 6%",
         reply_markup=get_main_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
     )
 
   elif text == "🔥 Розпродаж (-10%)":
     user_settings[user_id]["promo"] = "ГАряЧИЙ РОЗПРОДАЖ КОЛЕКЦІЇ"
     user_settings[user_id]["discount"] = 10.0
     await message.answer(
-        "✅ Успішно встановлено:\n• Акція: *ГАряЧИЙ РОЗПРОДАЖ"
-        " КОЛЕКЦІЇ*\n• Знижка: *10%*",
+        "✅ Успішно встановлено:\n• Акція: ГАряЧИЙ РОЗПРОДАЖ"
+        " КОЛЕКЦІЇ\n• Знижка: 10%",
         reply_markup=get_main_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
     )
 
   elif text == "✍️ Ввести свій текст акції":
@@ -196,19 +194,17 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
   elif text == "🔢 Ввести свій % знижки":
     await state.set_state(AdminStates.waiting_for_custom_discount)
     await message.answer(
-        "🔢 Введіть числом бажаний відсоток знижки (наприклад: `7.5` або `15`):",
+        "🔢 Введіть числом бажаний відсоток знижки (наприклад: 7.5 або 15):",
         reply_markup=ReplyKeyboardRemove(),
-        parse_mode=ParseMode.MARKDOWN,
     )
 
   elif text == "⚙️ Поточні налаштування":
     settings = user_settings[user_id]
     await message.answer(
-        f"📋 **Поточні налаштування:**\n"
-        f"• Акція: *{settings['promo']}*\n"
-        f"• Знижка: *{settings['discount']}%*",
+        f"📋 Поточні налаштування:\n"
+        f"• Акція: {settings['promo']}\n"
+        f"• Знижка: {settings['discount']}%",
         reply_markup=get_main_keyboard(),
-        parse_mode=ParseMode.MARKDOWN,
     )
 
 
@@ -225,9 +221,8 @@ async def save_custom_promo(message: Message, state: FSMContext):
 
   await state.clear()
   await message.answer(
-      f"✅ Текст акції змінено на:\n*{new_promo}*",
+      f"✅ Текст акції змінено на:\n{new_promo}",
       reply_markup=get_main_keyboard(),
-      parse_mode=ParseMode.MARKDOWN,
   )
 
 
@@ -241,7 +236,7 @@ async def save_custom_discount(message: Message, state: FSMContext):
     new_discount = float(text_input)
   except ValueError:
     await message.answer(
-        "❌ Помилка! Введіть лише число (наприклад: `7` або `12.5`):"
+        "❌ Помилка! Введіть лише число (наприклад: 7 або 12.5):"
     )
     return
 
@@ -255,9 +250,8 @@ async def save_custom_discount(message: Message, state: FSMContext):
 
   await state.clear()
   await message.answer(
-      f"✅ Розмір знижки змінено на: *{new_discount}%*",
+      f"✅ Розмір знижки змінено на: {new_discount}%",
       reply_markup=get_main_keyboard(),
-      parse_mode=ParseMode.MARKDOWN,
   )
 
 
@@ -278,23 +272,13 @@ async def handle_photos(message: Message):
   )
   photo_id = message.photo[-1].file_id
 
-  try:
-    await bot.send_photo(
-        chat_id=message.from_user.id,
-        photo=photo_id,
-        caption=new_caption,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=get_main_keyboard(),
-    )
-  except Exception as e:
-    logging.error(f"Markdown parse error: {e}")
-    plain_caption = f"🚨 {promo_text} 🚨\n\n{original_caption}\n\n🔥 Акційна ціна зі знижкою -{discount_percent}%"
-    await bot.send_photo(
-        chat_id=message.from_user.id,
-        photo=photo_id,
-        caption=plain_caption,
-        reply_markup=get_main_keyboard(),
-    )
+  # Отправляем фото в чистом тексте без parse_mode, чтобы избежать любых ошибок Telegram
+  await bot.send_photo(
+      chat_id=message.from_user.id,
+      photo=photo_id,
+      caption=new_caption,
+      reply_markup=get_main_keyboard(),
+  )
 
 
 async def main():
@@ -302,7 +286,7 @@ async def main():
 
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с удобным кнопочным меню и веб-заглушкой...")
+  print("Бот запущен с безопасным форматированием текста...")
   await dp.start_polling(bot)
 
 
