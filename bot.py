@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup  # <-- Вот этот импорт был нужен
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     KeyboardButton,
     Message,
@@ -73,40 +73,51 @@ def get_main_keyboard():
   return keyboard
 
 
+# Сверхгибкая функция расчета цены и формирования текста
 def apply_auction_logic(
     text: str, promo_header: str, discount_percent: float
 ) -> str:
   if not text:
     text = ""
 
-  # Паттерн для поиска цены (поддерживает пробелы между тысячами вроде "8 572")
-  pattern = r"(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.)"
+  # Паттерн ищет слово "Ціна" (необязательно) и число с пробелами тысяч перед валютой
+  pattern = (
+      r"(Ціна[:\s]*)?(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.|грнн)?\b"
+  )
   price_found = False
 
   def replace_price(match):
     nonlocal price_found
-    price_found = True
-    original_price_str = match.group(0)
-    raw_number = match.group(1).replace(" ", "").replace(",", ".")
-    currency = match.group(2)
+    raw_number = match.group(2).replace(" ", "").replace(",", ".")
     try:
       price = float(raw_number)
+      if price <= 0:
+        return match.group(0)
+
+      price_found = True
       new_price = price * (1 - discount_percent / 100)
       new_price_formatted = (
           int(new_price) if new_price.is_integer() else round(new_price, 2)
       )
+
+      prefix = match.group(1) or "Ціна: "
+      currency = match.group(3) or "грн"
+      original_full = match.group(0)
+
       return (
-          f"~~{original_price_str}~~"
+          f"~~{original_full}~~"
           f"\n🔥 **Акційна ціна: {new_price_formatted} {currency}**"
           f" (-{discount_percent}%)"
       )
     except ValueError:
-      return original_price_str
+      return match.group(0)
 
   updated_text = re.sub(pattern, replace_price, text, count=1, flags=re.IGNORECASE)
 
   if not price_found:
-    updated_text += f"\n\n🔥 **Акційна знижка: -{discount_percent}%**"
+    updated_text += (
+        f"\n\n🔥 **Акційна ціна зі знижкою -{discount_percent}%**"
+    )
 
   return f"🚨 **{promo_header}** 🚨\n\n{updated_text}"
 
@@ -167,10 +178,10 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     )
 
   elif text == "🔥 Розпродаж (-10%)":
-    user_settings[user_id]["promo"] = "ГАВЯЧИЙ РОЗПРОДАЖ КОЛЕКЦІЇ"
+    user_settings[user_id]["promo"] = "ГАряЧИЙ РОЗПРОДАЖ КОЛЕКЦІЇ"
     user_settings[user_id]["discount"] = 10.0
     await message.answer(
-        "✅ Успішно встановлено:\n• Акція: *ГАВЯЧИЙ РОЗПРОДАЖ"
+        "✅ Успішно встановлено:\n• Акція: *ГАряЧИЙ РОЗПРОДАЖ"
         " КОЛЕКЦІЇ*\n• Знижка: *10%*",
         reply_markup=get_main_keyboard(),
         parse_mode=ParseMode.MARKDOWN,
@@ -278,7 +289,7 @@ async def handle_photos(message: Message):
     )
   except Exception as e:
     logging.error(f"Markdown parse error: {e}")
-    plain_caption = f"🚨 {promo_text} 🚨\n\n{original_caption}\n\n🔥 Акція: -{discount_percent}%"
+    plain_caption = f"🚨 {promo_text} 🚨\n\n{original_caption}\n\n🔥 Акційна ціна зі знижкою -{discount_percent}%"
     await bot.send_photo(
         chat_id=message.from_user.id,
         photo=photo_id,
