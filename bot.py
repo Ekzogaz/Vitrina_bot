@@ -1,11 +1,12 @@
 import asyncio
+import http.server
 import logging
+import os
 import re
+import threading
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     KeyboardButton,
     Message,
@@ -23,6 +24,30 @@ dp = Dispatcher()
 user_settings = {}
 
 
+# --- ВСТРОЕННЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# Он нужен только для того, чтобы Render видел открытый порт и не ругался таймаутом
+def run_dummy_web_server():
+  port = int(os.environ.get("PORT", 10000))
+
+  class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+
+    def do_GET(self):
+      self.send_response(200)
+      self.end_headers()
+      self.wfile.write(b"Bot is alive and running!")
+
+    def log_message(self, format, *args):
+      pass  # Отключаем лишний спам в логах от пинг-запросов Render
+
+  server_address = ("0.0.0.0", port)
+  httpd = http.server.HTTPServer(server_address, HealthCheckHandler)
+  print(f"Веб-заглушка запущена на порту {port}")
+  httpd.serve_forever()
+
+
+# ----------------------------------------
+
+
 # Состояния для ввода через интерактивный диалог по кнопкам
 class AdminStates(StatesGroup):
   waiting_for_custom_promo = State()
@@ -32,20 +57,20 @@ class AdminStates(StatesGroup):
 # Главная клавиатура с кнопками управления
 def get_main_keyboard():
   keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [
-            KeyboardButton(text="💎 Pre-Black Friday (-6%)"),
-            KeyboardButton(text="🔥 Розпродаж (-10%)",),
-        ],
-        [
-            KeyboardButton(text="✍️ Ввести свій текст акції"),
-            KeyboardButton(text="🔢 Ввести свій % знижки"),
-        ],
-        [
-            KeyboardButton(text="⚙️ Поточні налаштування"),
-        ],
-    ],
-    resize_keyboard=True,
+      keyboard=[
+          [
+              KeyboardButton(text="💎 Pre-Black Friday (-6%)"),
+              KeyboardButton(text="🔥 Розпродаж (-10%)"),
+          ],
+          [
+              KeyboardButton(text="✍️ Ввести свій текст акції"),
+              KeyboardButton(text="🔢 Ввести свій % знижки"),
+          ],
+          [
+              KeyboardButton(text="⚙️ Поточні налаштування"),
+          ],
+      ],
+      resize_keyboard=True,
   )
   return keyboard
 
@@ -106,7 +131,8 @@ async def cmd_start(message: Message, state: FSMContext):
       f"📋 **Поточні налаштування:**\n"
       f"• Акція: *{settings['promo']}*\n"
       f"• Знижка: *{settings['discount']}%*\n\n"
-      "Оберіть дію на клавіатурі нижче або просто **кидайте пачку фото** с товарами!",
+      "Оберіть дію на клавіатурі нижче або просто **кидайте пачку фото** з"
+      " товарами!",
       reply_markup=get_main_keyboard(),
       parse_mode=ParseMode.MARKDOWN,
   )
@@ -178,7 +204,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     )
 
 
-# Шаг: сохранение своего текста акции, введенного пользователем
+# Шаг: сохранение своего текста акции
 @dp.message(AdminStates.waiting_for_custom_promo, F.text)
 async def save_custom_promo(message: Message, state: FSMContext):
   user_id = message.from_user.id
@@ -197,7 +223,7 @@ async def save_custom_promo(message: Message, state: FSMContext):
   )
 
 
-# Шаг: сохранение своей скидки, введенной пользователем
+# Шаг: сохранение своей скидки
 @dp.message(AdminStates.waiting_for_custom_discount, F.text)
 async def save_custom_discount(message: Message, state: FSMContext):
   user_id = message.from_user.id
@@ -227,7 +253,7 @@ async def save_custom_discount(message: Message, state: FSMContext):
   )
 
 
-# Обработчик фотографий (работает и с пачками, и с одиночными фото)
+# Обработчик фотографий
 @dp.message(F.photo)
 async def handle_photos(message: Message):
   user_id = message.from_user.id
@@ -264,9 +290,12 @@ async def handle_photos(message: Message):
 
 
 async def main():
+  # Запускаем веб-заглушку в отдельном фоновом потоке, чтобы Render видел открытый порт
+  threading.Thread(target=run_dummy_web_server, daemon=True).start()
+
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с удобным кнопочным меню...")
+  print("Бот запущен с удобным кнопочным меню и веб-заглушкой...")
   await dp.start_polling(bot)
 
 
