@@ -25,7 +25,7 @@ TOKEN = "9085949690:AAGAQLcj2ZBEG0FU1tqcHT6SZBm73w-gHtk"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Файл для постоянного хранения базы постов всех пользователей
+# Файлы для постоянного хранения данных
 DB_FILE = "group_posts_db.json"
 SETTINGS_FILE = "user_settings.json"
 
@@ -49,9 +49,7 @@ def save_json(filename, data):
 
 
 # Загружаем базы при старте
-# Структура: {str(user_id): {str(chat_id): {norm_code: {"photo": str, "caption": str}}}}
 user_databases = load_json(DB_FILE, {})
-# Структура: {str(user_id): {"promo": str, "discount": float}}
 users_settings = load_json(SETTINGS_FILE, {})
 
 
@@ -219,7 +217,7 @@ async def cmd_start(message: Message, state: FSMContext):
       f"📋 Ваші поточні налаштування:\n"
       f"• Акція: {settings['promo']}\n"
       f"• Знижка: {settings['discount']}%\n\n"
-      "• Пересилайте звичайні пости сюди для збереження у вашу базу.\n"
+      "• Пересилайте звичайні пости сюди — бот автоматично захищає базу від дублікатів.\n"
       "• Натискайте «🔥 Акція», щоб переслати товари і на лету отримати розрахунок знижки!",
       reply_markup=get_main_keyboard(user_id),
   )
@@ -242,7 +240,7 @@ async def collect_promo_photos(message: Message, state: FSMContext):
   await message.answer(f"✅ Додано товар для акції №{count}. Надсилайте ще або натисніть «Готово».")
 
 
-# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В ПЕРСОНАЛЬНУЮ БАЗУ ---
+# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В ПЕРСОНАЛЬНУЮ БАЗУ (С ЗАЩИТОЙ ОТ ДУБЛИКАТОВ) ---
 @dp.message(F.photo)
 async def auto_collect_posts(message: Message, state: FSMContext):
   current_state = await state.get_state()
@@ -260,14 +258,21 @@ async def auto_collect_posts(message: Message, state: FSMContext):
     if chat_id not in user_databases[user_id]:
       user_databases[user_id][chat_id] = {}
 
+    # Проверяем, был ли уже такой товар в базе
+    is_update = code in user_databases[user_id][chat_id]
+
     user_databases[user_id][chat_id][code] = {
         "photo": message.photo[-1].file_id,
         "caption": caption
     }
     save_json(DB_FILE, user_databases)
     
-    total_saved = sum(len(posts) for chats in user_databases[user_id].values() for posts in chats.values()) if isinstance(list(user_databases[user_id].values())[0], dict) else sum(len(p) for p in user_databases[user_id].values())
-    await message.answer(f"✅ Товар із кодом `{code}` записано у вашу базу! (Всього у вашій базі: {total_saved} шт.)", parse_mode=ParseMode.MARKDOWN)
+    total_saved = sum(len(posts) for chats in user_databases[user_id].values() for posts in chats.values())
+    
+    if is_update:
+      await message.answer(f"🔄 Товар із кодом `{code}` вже був у базі, його дані оновлено (дублікат не створено). Всього у базі: {total_saved} шт.", parse_mode=ParseMode.MARKDOWN)
+    else:
+      await message.answer(f"✅ Товар із кодом `{code}` успішно додано до бази! (Всього у вашій базі: {total_saved} шт.)", parse_mode=ParseMode.MARKDOWN)
   else:
     await message.answer("ℹ️ У тексті цього фото не знайдено рядок «Код ...». Воно не додано до бази.", reply_markup=get_main_keyboard(message.from_user.id))
 
@@ -299,7 +304,8 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_group_table)
     await message.answer(
         f"📥 У вашій базі даних збережено виробів: **{total_saved} шт.**\n\n"
-        "Надішліть файл Excel (`.xlsx`) або скопіюйте текст із таблиці ціноутворення 1С.",
+        "Надішліть файл Excel (`.xlsx`) або скопіюйте текст із таблиці ціноутворення 1С.\n"
+        "*(Після оновлення все, чого немає в цій таблиці, автоматично видалиться з бази як продане)*",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -384,7 +390,7 @@ async def finish_promo_batch(message: Message, state: FSMContext):
   )
 
 
-# --- ОБРАБОТКА ТАБЛИЦЫ ДЛЯ ОБНОВЛЕНИЯ ЦЕН ИЗ ПЕРСОНАЛЬНОЙ БАЗЫ ---
+# --- ОБРАБОТКА ТАБЛИЦЫ 1С: ОБНОВЛЕНИЕ ЦЕН И АВТОМАТИЧЕСКАЯ ОЧИСТКА ПРОДАННОГО ---
 @dp.message(AdminStates.waiting_for_group_table, F.document | F.text)
 async def process_table_and_send_posts(message: Message, state: FSMContext):
   user_id = str(message.from_user.id)
@@ -443,15 +449,23 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
     await state.clear()
     return
 
-  await message.answer("🔄 Формую чисті пости з новими цінами з вашої бази...")
+  await message.answer("🔄 Оновлюю ціни та синхронізую базу з 1С...")
 
   sent_count = 0
   user_db = user_databases.get(user_id, {})
+  new_user_db = {}
+  removed_count = 0
+
   for chat_id, posts in user_db.items():
+    new_user_db[chat_id] = {}
     for code, post_info in posts.items():
+      # Оставляем в базе ТОЛЬКО то, что есть в свежей таблице 1С
       if code in price_database:
         new_price = price_database[code]
         cleaned_caption = update_price_and_clean_caption(post_info["caption"], new_price)
+
+        # Сохраняем товар в обновленной чистой базе
+        new_user_db[chat_id][code] = post_info
 
         try:
           await bot.send_photo(
@@ -463,18 +477,25 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
           await asyncio.sleep(0.3)
         except Exception as e:
           logging.error(f"Ошибка отправки поста: {e}")
+      else:
+        removed_count += 1
+
+  # Перезаписываем базу пользователя, удаляя проданные/отсутствующие позиции
+  user_databases[user_id] = new_user_db
+  save_json(DB_FILE, user_databases)
 
   await state.clear()
   await message.answer(
-      f"✅ Готово! Надіслано оновлених постів: {sent_count}\n"
-      "Усі ціни оновлено за таблицею, штрихкоди приховані.",
+      f"✅ Готово!\n"
+      f"• Надіслано оновлених постів: {sent_count}\n"
+      f"• Видалено з бази (продано / немає в 1С): {removed_count} шт.\n\n"
+      "База повністю синхронізована з актуальними даними 1С!",
       reply_markup=get_main_keyboard(message.from_user.id),
   )
 
 
 @dp.message(AdminStates.waiting_for_custom_promo, F.text)
 async def save_custom_promo(message: Message, state: FSMContext):
-  user_id = str(message.from_user.id)
   settings = get_user_settings(message.from_user.id)
   settings["promo"] = message.text.strip()
   save_json(SETTINGS_FILE, users_settings)
@@ -484,7 +505,6 @@ async def save_custom_promo(message: Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_for_custom_discount, F.text)
 async def save_custom_discount(message: Message, state: FSMContext):
-  user_id = str(message.from_user.id)
   try:
     val = float(message.text.strip().replace(",", "."))
   except ValueError:
@@ -501,7 +521,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Многопользовательский бот запущен...")
+  print("Бот запущен с защитой от дубликатов и автоочисткой по 1С...")
   await dp.start_polling(bot)
 
 
