@@ -119,7 +119,7 @@ def normalize_code(code_str: str) -> str:
   return clean_digits.lstrip("0")
 
 
-# Точное извлечение штрихкода (именно по слову Код/Штрихкод)
+# Точное извлечение штрихкода для базы
 def extract_code_from_text(text: str):
   if not text:
     return None
@@ -162,7 +162,7 @@ def update_price_and_clean_caption(caption: str, new_price: float) -> str:
   return remove_code_line(updated_text)
 
 
-# Логика расчета скидки на лету для акций
+# Логика расчета скидки на лету для акций (без кодов, с зачеркиванием)
 def apply_promo_logic(text: str, promo_header: str, discount_percent: float) -> str:
   if not text:
     text = ""
@@ -213,31 +213,30 @@ async def cmd_start(message: Message, state: FSMContext):
   )
 
 
-# --- ОБРАБОТКА ФОТО (ФОНОВАЯ БАЗА ИЛИ ПЕРЕСЫЛКА ДЛЯ АКЦИЙ) ---
+# --- 1. РЕЖИМ АКЦИИ (ПЕРЕСЫЛКА ФОТО НА ЛЕТУ) ---
+@dp.message(AdminStates.waiting_for_promo_photos, F.photo)
+async def collect_promo_photos(message: Message, state: FSMContext):
+  user_id = message.from_user.id
+  if not hasattr(message.bot, "promo_batch"):
+    message.bot.promo_batch = {}
+  if user_id not in message.bot.promo_batch:
+    message.bot.promo_batch[user_id] = []
+  
+  message.bot.promo_batch[user_id].append({
+      "photo": message.photo[-1].file_id,
+      "caption": message.caption or ""
+  })
+  count = len(message.bot.promo_batch[user_id])
+  await message.answer(f"✅ Додано товар для акції №{count}. Надсилайте ще або натисніть «Готово».")
+
+
+# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В БАЗУ ---
 @dp.message(F.photo)
 async def auto_collect_posts(message: Message, state: FSMContext):
   current_state = await state.get_state()
-  user_id = message.from_user.id
-
-  # РЕЖИМ АКЦИИ: собираем пересланные фото во временный пакет
-  if current_state == AdminStates.waiting_for_promo_photos.state:
-    if not hasattr(message.bot, "promo_batch"):
-      message.bot.promo_batch = {}
-    if user_id not in message.bot.promo_batch:
-      message.bot.promo_batch[user_id] = []
-    
-    message.bot.promo_batch[user_id].append({
-        "photo": message.photo[-1].file_id,
-        "caption": message.caption or ""
-    })
-    count = len(message.bot.promo_batch[user_id])
-    await message.answer(f"✅ Додано товар для акції №{count}. Надсилайте ще або натисніть «Готово».")
-    return
-
   if current_state == AdminStates.waiting_for_group_table.state:
     return
 
-  # ОБЫЧНЫЙ РЕЖИМ: сохраняем в постоянную базу для цен из 1С
   caption = message.caption or ""
   code = extract_code_from_text(caption)
 
@@ -299,7 +298,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     settings = user_settings[user_id]
     await message.answer(
         f"🔥 **Режим акції (поточна знижка: {settings['discount']}%)**\n\n"
-        "Перешліть сюди товари (наприклад, золото або срібло), для яких робите акцію. "
+        "Перешліть сюди товари, для яких робите акцію (ніяких кодів не потрібно!). "
         "Коли перешліть усі, натисніть кнопку нижче ⬇️",
         reply_markup=get_done_promo_keyboard(),
     )
@@ -487,7 +486,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен успешно...")
+  print("Бот запущен с разделением режимов...")
   await dp.start_polling(bot)
 
 
