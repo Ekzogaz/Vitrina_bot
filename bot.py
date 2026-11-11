@@ -26,8 +26,6 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 user_settings = {}
-
-# Файл для постоянной базы цен по таблице
 DB_FILE = "group_posts_db.json"
 
 
@@ -52,37 +50,33 @@ def save_database(db):
 group_database = load_database()
 
 
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (GET + HEAD) ---
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 def run_dummy_web_server():
   port = int(os.environ.get("PORT", 10000))
 
   class FastHealthHandler(http.server.BaseHTTPRequestHandler):
-
     def do_GET(self):
       self.send_response(200)
       self.send_header("Content-type", "text/plain; charset=utf-8")
       self.end_headers()
       self.wfile.write(b"OK")
-
     def do_HEAD(self):
       self.send_response(200)
       self.send_header("Content-type", "text/plain; charset=utf-8")
       self.end_headers()
-
     def log_message(self, format, *args):
       pass
 
   server_address = ("0.0.0.0", port)
   httpd = http.server.HTTPServer(server_address, FastHealthHandler)
-  print(f"Веб-сервер запущен на порту {port}")
   httpd.serve_forever()
 
 
 class AdminStates(StatesGroup):
   waiting_for_custom_promo = State()
   waiting_for_custom_discount = State()
-  waiting_for_group_table = State()      # Ожидание прайса из 1С
-  waiting_for_promo_photos = State()     # Ожидание пачки фото для акции
+  waiting_for_group_table = State()      # Ждем таблицу 1С для обычной смены цен
+  waiting_for_promo_photos = State()     # Ждем пачку фото для акции
 
 
 def get_main_keyboard(user_id):
@@ -100,6 +94,7 @@ def get_main_keyboard(user_id):
           [
               KeyboardButton(text="⚙️ Поточні налаштування"),
               KeyboardButton(text="📊 Статистика бази"),
+              KeyboardButton(text="🗑 Очистити базу"),
           ],
       ],
       resize_keyboard=True,
@@ -125,17 +120,13 @@ def normalize_code(code_str: str) -> str:
   return clean_digits.lstrip("0")
 
 
-# Извлечение штрихкода
+# Точное извлечение штрихкода (ищет именно после слов Код/Штрихкод, игнорируя телефоны)
 def extract_code_from_text(text: str):
   if not text:
     return None
   match = re.search(r"(?:штрихкод|код)\s*[:\-]?\s*(\d[\d\s]*\d)", text, re.IGNORECASE)
   if match:
     return normalize_code(match.group(1))
-  
-  match_num = re.search(r"\b(\d{8,15})\b", text)
-  if match_num:
-    return normalize_code(match_num.group(1))
     
   return None
 
@@ -215,22 +206,21 @@ async def cmd_start(message: Message, state: FSMContext):
   settings = user_settings[user_id]
   await message.answer(
       "Привіт! 👋\n\n"
-      "Я ваш бот-помічник.\n"
-      "• Пересилайте звичайні пости для збереження в базу.\n"
-      "• Використовуйте таблицю для масового оновлення цін.\n"
-      "• Або запускайте акції на потрібні товари за пару кліків!",
+      "Я ваш помічник.\n"
+      "• Пересилайте звичайні пости сюди, щоб зберегти їх у базу для повсякденного оновлення цін.\n"
+      "• Для акцій натискайте «Зробити акцію», пересилайте кілька товарів — і бот розрахує знижку!",
       reply_markup=get_main_keyboard(user_id),
   )
 
 
-# --- НАКОПЛЕНИЕ БАЗЫ «НА ЛЕТУ» ---
+# --- НАКОПЛЕНИЕ БАЗЫ «НА ЛЕТУ» ИЛИ СБОР ДЛЯ АКЦИЙ ---
 @dp.message(F.photo)
 async def auto_collect_posts(message: Message, state: FSMContext):
   current_state = await state.get_state()
-  
-  # Если мы ждем фото для акции, собираем их во временный список
+  user_id = message.from_user.id
+
+  # 1. Если активирован режим акции — собираем фото во временный список
   if current_state == AdminStates.waiting_for_promo_photos.state:
-    user_id = message.from_user.id
     if not hasattr(message.bot, "promo_batch"):
       message.bot.promo_batch = {}
     if user_id not in message.bot.promo_batch:
@@ -241,14 +231,13 @@ async def auto_collect_posts(message: Message, state: FSMContext):
         "caption": message.caption or ""
     })
     count = len(message.bot.promo_batch[user_id])
-    await message.answer(f"✅ Додано фото для акції №{count}. Надсилайте ще або натисніть «Готово».")
+    await message.answer(f"✅ Додано товар для акції №{count}. Надсилайте ще або натисніть «Готово».")
     return
 
   if current_state == AdminStates.waiting_for_group_table.state:
     return
 
-  # Обычное сохранение в постоянную базу
-  user_id = message.from_user.id
+  # 2. Обычное фоновое сохранение в постоянную базу цен
   caption = message.caption or ""
   code = extract_code_from_text(caption)
 
@@ -266,7 +255,7 @@ async def auto_collect_posts(message: Message, state: FSMContext):
     total_saved = sum(len(posts) for posts in group_database.values())
     await message.answer(f"✅ Товар із кодом `{code}` записано в базу! (Всього в базі: {total_saved} шт.)", parse_mode=ParseMode.MARKDOWN)
   else:
-    await message.answer("ℹ️ Фото збережено в базі, але штрихкод у тексті не знайдено.", reply_markup=get_main_keyboard(user_id))
+    await message.answer("ℹ️ У тексті цього фото не знайдено рядок «Код ...». Воно не додано до бази.", reply_markup=get_main_keyboard(user_id))
 
 
 @dp.message(
@@ -276,6 +265,7 @@ async def auto_collect_posts(message: Message, state: FSMContext):
         "🔢 Ввести свій % знижки",
         "⚙️ Поточні налаштування",
         "📊 Статистика бази",
+        "🗑 Очистити базу",
     })
 )
 async def handle_menu_buttons(message: Message, state: FSMContext):
@@ -299,7 +289,6 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     )
 
   elif text.startswith("🔥 Зробити акцію"):
-    # Запускаем режим приема товаров для акции
     if not hasattr(message.bot, "promo_batch"):
       message.bot.promo_batch = {}
     message.bot.promo_batch[user_id] = []
@@ -316,6 +305,13 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
   elif text == "📊 Статистика бази":
     total_saved = sum(len(posts) for posts in group_database.values())
     await message.answer(f"📊 Статистика:\n• Загалом збережених товарів у базі: {total_saved} шт.", reply_markup=get_main_keyboard(user_id))
+
+  elif text == "🗑 Очистити базу":
+    global group_database
+    group_database = {}
+    if os.path.exists(DB_FILE):
+      os.remove(DB_FILE)
+    await message.answer("🗑 База даних повністю очищена.", reply_markup=get_main_keyboard(user_id))
 
   elif text == "✍️ Ввести свій текст акції":
     await state.set_state(AdminStates.waiting_for_custom_promo)
@@ -335,7 +331,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     )
 
 
-# --- ОБРАБОТКА ГОТОВОЙ ПАЧКИ ДЛЯ АКЦИИ ---
+# --- ВЫДАЧА АКЦИОННЫХ ПОСТОВ ---
 @dp.message(AdminStates.waiting_for_promo_photos, F.text == "✅ Готово, застосувати знижку")
 async def finish_promo_batch(message: Message, state: FSMContext):
   user_id = message.from_user.id
@@ -361,7 +357,6 @@ async def finish_promo_batch(message: Message, state: FSMContext):
     except Exception as e:
       logging.error(f"Ошибка отправки акционного фото: {e}")
 
-  # Очищаем временный список
   message.bot.promo_batch[user_id] = []
   await state.clear()
 
@@ -372,7 +367,7 @@ async def finish_promo_batch(message: Message, state: FSMContext):
   )
 
 
-# --- ОБРАБОТКА ТАБЛИЦЫ ДЛЯ ОБНОВЛЕНИЯ ЦЕН ---
+# --- ОБРАБОТКА ТАБЛИЦЫ ДЛЯ ОБНОВЛЕНИЯ ЦЕН ИЗ БАЗЫ ---
 @dp.message(AdminStates.waiting_for_group_table, F.document | F.text)
 async def process_table_and_send_posts(message: Message, state: FSMContext):
   user_id = message.from_user.id
@@ -431,7 +426,7 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
     await state.clear()
     return
 
-  await message.answer("🔄 Формую чисті пости з новими цінами...")
+  await message.answer("🔄 Формую чисті пости з новими цінами з бази...")
 
   sent_count = 0
   for chat_str_id, posts in group_database.items():
@@ -484,7 +479,8 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с поддержкой гибких акций и базы цен...")
+  print("Бот запущен с разделением на базу цен и режим пересылки для акций...")
+  await dp.start_polling(user_settings=user_settings)
   await dp.start_polling(bot)
 
 
