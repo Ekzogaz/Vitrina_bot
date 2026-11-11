@@ -26,7 +26,7 @@ dp = Dispatcher()
 user_settings = {}
 
 
-# --- УПРОЩЕННЫЙ И СВЕРХБЫСТРЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# --- УПРОЩЕННЫЙ ВЕБ-СЕРВЕР С ПОДДЕРЖКОЙ GET И HEAD ДЛЯ UPTIMEROBOT ---
 def run_dummy_web_server():
   port = int(os.environ.get("PORT", 10000))
 
@@ -38,8 +38,13 @@ def run_dummy_web_server():
       self.end_headers()
       self.wfile.write(b"OK")
 
+    def do_HEAD(self):
+      self.send_response(200)
+      self.send_header("Content-type", "text/plain; charset=utf-8")
+      self.end_headers()
+
     def log_message(self, format, *args):
-      pass  # Убираем лишний мусор из логов
+      pass
 
   server_address = ("0.0.0.0", port)
   httpd = http.server.HTTPServer(server_address, FastHealthHandler)
@@ -93,7 +98,6 @@ def apply_auction_logic(
 
       price_found = True
       new_price = price * (1 - discount_percent / 100)
-      # Округляем до ближайшего целого числа
       new_price_formatted = round(new_price)
 
       currency = match.group(3) or "грн"
@@ -257,7 +261,7 @@ async def main():
 
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с оптимизированным сервером...")
+  print("Бот запущен с поддержкой GET и HEAD...")
   await dp.start_polling(bot)
 
 
