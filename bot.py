@@ -25,7 +25,6 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 user_settings = {}
-# Временное хранилище отсканированных товаров из группы для конкретного пользователя
 user_group_scan = {}  # {user_id: [list of dicts with photo_id and caption]}
 
 
@@ -58,8 +57,8 @@ def run_dummy_web_server():
 class AdminStates(StatesGroup):
   waiting_for_custom_promo = State()
   waiting_for_custom_discount = State()
-  waiting_for_group_link = State()     # Ожидание пересланного поста из группы для сканирования
-  waiting_for_group_table = State()    # Ожидание файла/текста с ценами
+  waiting_for_group_link = State()     
+  waiting_for_group_table = State()    
 
 
 def get_main_keyboard():
@@ -168,7 +167,7 @@ def update_price_straight_and_clean(caption: str, new_price: float) -> str:
   if not price_found:
     updated_text += f"\n\nЦіна {formatted_new_price} грн"
 
-  # Удаляем строчку с кодом/штрихкодом, чтобы клиенты её не видели в итоговом посте
+  # Удаляем строчку с кодом/штрихкодом, чтобы клиенты её не видели
   updated_text = re.sub(r"^(код|штрихкод)\s*[:\-]?\s*\d+\s*$", "", updated_text, flags=re.IGNORECASE | re.MULTILINE)
   updated_text = re.sub(r"\n\s*\n\s*\n", "\n\n", updated_text).strip()
 
@@ -211,9 +210,8 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     user_settings[user_id] = {"promo": "АКЦІЙНА ПРОПОЗИЦІЯ", "discount": 5.0}
 
   if text == "🔄 Обновити ціни за таблицею":
-    await state.set_state(AdminStates.waiting_for_group_table) # Временно используем для старого режима если нужно
     await message.answer(
-        "📥 Ви можете переслати сюди пачку фотографій з «Ізбранного» або скористатись новою кнопкою **«🔍 Сканувати групу»**.",
+        "📥 Ви можете надіслати файл таблиці або скористатись кнопкою **«🔍 Сканувати групу»**.",
         reply_markup=get_main_keyboard(),
     )
 
@@ -222,7 +220,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     await message.answer(
         "🔍 **Сканування групи:**\n\n"
         "Будь ласка, **перешліть сюди будь-яке повідомлення з вашої групи з виробами** "
-        "(це потрібно лише один раз, щоб бот зрозумів, з якої групи брати порти).",
+        "(тепер бот прийме будь-яке переслане повідомлення та спробує витягнути історію).",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -244,78 +242,70 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     )
 
 
-# Шаг 1 нового режима: получаем пересланное сообщение из группы, чтобы узнать ID чата
+# Упрощенный прием пересланного сообщения (без жесткой проверки источника)
 @dp.message(AdminStates.waiting_for_group_link)
 async def process_group_forward(message: Message, state: FSMContext):
   user_id = message.from_user.id
   
-  # Проверяем, действительно ли сообщение переслано из группы/канала
-  if not message.forward_from_chat:
-    await message.answer("❌ Це не схоже на переслане повідомлення з групи. Будь ласка, перешліть пост прямо з вашої групи виробів.")
+  # Проверяем, есть ли у сообщения вообще признак пересылки
+  if not message.forward_date and not message.forward_from_chat:
+    await message.answer("❌ Будь ласка, саме **перешліть** повідомлення (а не скопіюйте текст).")
     return
 
-  chat_id = message.forward_from_chat.id
-  await message.answer("⏳ Отримую останні пости з групи...")
+  chat_id = message.forward_from_chat.id if message.forward_from_chat else message.chat.id
+  forward_msg_id = message.forward_from_message_id or message.message_id
+
+  await message.answer("⏳ Зчитую пости з групи...")
 
   scanned_items = []
-  
-  # Пробуем собрать последние сообщения из группы методом перебора ID сообщений назад
-  # (Бот проверяет последние 150 сообщений в группе)
-  forward_msg_id = message.forward_from_message_id or 1000
-  
   success_count = 0
-  # Сканируем диапазон вокруг пересланного сообщения
+  
+  # Сканируем диапазон сообщений вокруг пересланного
   for msg_id in range(max(1, forward_msg_id - 100), forward_msg_id + 20):
     try:
-      # Получаем сообщение из группы
       msg = await bot.get_message(chat_id=chat_id, message_id=msg_id)
       if msg and msg.photo and msg.caption:
         code = extract_code_from_text(msg.caption)
         if code:
-          photo_id = msg.photo[-1].file_id
-          scanned_items.append({"photo": photo_id, "caption": msg.caption})
+          scanned_items.append({"photo": msg.photo[-1].file_id, "caption": msg.caption})
           success_count += 1
-      await asyncio.sleep(0.05) # небольшая пауза против лимитов Telegram
+      await asyncio.sleep(0.03)
     except Exception:
       continue
 
   if not scanned_items:
-    # Если не удалось вытянуть автоматически, предлагаем пользователю скинуть их пачкой или проверяем права
     await message.answer(
-        "⚠️ Не вдалося автоматично прочитати історію групи (можливо, обмеження Telegram на читання старих постів до заходу бота).\n\n"
-        "Але нічого страшного! Ви можете просто **переслати потрібні пости пачкою сюди в чат**, і бот збере їх.",
+        "⚠️ Не вдалося прочитати історію автоматично. "
+        "Але ви можете просто переслати потрібні пости пачкою сюди в чат, і бот миттєво їх підхопить!",
         reply_markup=get_main_keyboard()
     )
     await state.clear()
     return
 
-  # Сохраняем отсканированные посты во временную память пользователя
   user_group_scan[user_id] = scanned_items
 
   await state.set_state(AdminStates.waiting_for_group_table)
   await message.answer(
-      f"✅ Успішно знайдено виробів у групі з кодами: **{success_count} шт.**\n\n"
+      f"✅ Успішно знайдено виробів з кодами: **{success_count} шт.**\n\n"
       "**Крок 2 з 2:**\n"
-      "Тепер просто **надішліть сюди файл Excel (`.xlsx`)** АБО **скопіюйте і вставте текст із таблиці** (штрихкод та ціна). "
-      "Бот опрацює їх і надішле вам готові результати!",
+      "Тепер просто **надішліть сюди файл Excel (`.xlsx`)** АБО **скопіюйте і вставте текст із таблиці** (штрихкод та ціна).",
       reply_markup=ReplyKeyboardRemove(),
   )
 
 
-# Шаг 2 нового режима: получаем таблицу или текст, сопоставляем и выдаем результат в чат
+# Обработка таблицы или текста для отсканированных товаров
 @dp.message(AdminStates.waiting_for_group_table, F.document | F.text)
 async def process_scanned_table_input(message: Message, state: FSMContext):
   user_id = message.from_user.id
   photos = user_group_scan.get(user_id, [])
 
   if not photos:
-    # Если зашли сюда через старую кнопку отправки фото
-    await handle_old_batch_flow(message, state)
+    await message.answer("Спочатку натисніть «🔍 Сканувати групу».", reply_markup=get_main_keyboard())
+    await state.clear()
     return
 
   price_database = {}
 
-  # 1. Читаем файл Excel
   if message.document:
     file_info = await bot.get_file(message.document.file_id)
     downloaded_file = await bot.download_file(file_info.file_path)
@@ -348,7 +338,6 @@ async def process_scanned_table_input(message: Message, state: FSMContext):
       await message.answer(f"❌ Помилка читання файлу: {e}")
       return
 
-  # 2. Читаем текст
   elif message.text:
     lines = message.text.split("\n")
     for line in lines:
@@ -385,7 +374,7 @@ async def process_scanned_table_input(message: Message, state: FSMContext):
     if found_price is not None:
       new_caption = update_price_straight_and_clean(caption, found_price)
     else:
-      new_caption = update_price_straight_and_clean(caption, 0) if False else caption
+      new_caption = caption
 
     await bot.send_photo(
         chat_id=message.from_user.id,
@@ -402,13 +391,6 @@ async def process_scanned_table_input(message: Message, state: FSMContext):
       "Усі готові пости вище сформовані **без службового коду** — можете сміливо пересилати їх у вашу групу!",
       reply_markup=get_main_keyboard(),
   )
-
-
-# Обработка старого процесса (на случай ручной пересылки фото)
-async def handle_old_batch_flow(message: Message, state: FSMContext):
-  # Если пользователь решил пойти старым путем через пересылку фоток
-  await message.answer("Будь ласка, скористайтесь кнопкою «🔍 Сканувати групу» або надішліть фотографії заново.", reply_markup=get_main_keyboard())
-  await state.clear()
 
 
 # Обработка обычных фото со скидкой
@@ -455,7 +437,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с функцией сканирования группы и выдачей результатов в чат...")
+  print("Бот запущен с обновленным сканированием без жесткой проверки источника...")
   await dp.start_polling(bot)
 
 
