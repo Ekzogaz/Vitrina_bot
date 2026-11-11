@@ -76,16 +76,15 @@ class AdminStates(StatesGroup):
   waiting_for_custom_promo = State()
   waiting_for_custom_discount = State()
   waiting_for_group_table = State()      # Ждем таблицу 1С для обычной смены цен
-  waiting_for_promo_photos = State()     # Ждем пачку фото для акции
+  waiting_for_promo_photos = State()     # Ждем пачку фото для акции (на лету)
 
 
-def get_main_keyboard(user_id):
-  settings = user_settings.get(user_id, {"promo": "АКЦІЙНА ПРОПОЗИЦІЯ", "discount": 6.0})
+def get_main_keyboard():
   keyboard = ReplyKeyboardMarkup(
       keyboard=[
           [
               KeyboardButton(text="🔄 Отримати оновлені пости за таблицею"),
-              KeyboardButton(text=f"🔥 Зробити акцію (-{settings['discount']}%)"),
+              KeyboardButton(text="🔥 Акція"),
           ],
           [
               KeyboardButton(text="✍️ Ввести свій текст акції"),
@@ -120,14 +119,13 @@ def normalize_code(code_str: str) -> str:
   return clean_digits.lstrip("0")
 
 
-# Точное извлечение штрихкода (ищет именно после слов Код/Штрихкод, игнорируя телефоны)
+# Точное извлечение штрихкода (именно по слову Код/Штрихкод)
 def extract_code_from_text(text: str):
   if not text:
     return None
   match = re.search(r"(?:штрихкод|код)\s*[:\-]?\s*(\d[\d\s]*\d)", text, re.IGNORECASE)
   if match:
     return normalize_code(match.group(1))
-    
   return None
 
 
@@ -164,7 +162,7 @@ def update_price_and_clean_caption(caption: str, new_price: float) -> str:
   return remove_code_line(updated_text)
 
 
-# Логика скидки для акционного режима
+# Логика расчета скидки на лету для акций
 def apply_promo_logic(text: str, promo_header: str, discount_percent: float) -> str:
   if not text:
     text = ""
@@ -206,20 +204,22 @@ async def cmd_start(message: Message, state: FSMContext):
   settings = user_settings[user_id]
   await message.answer(
       "Привіт! 👋\n\n"
-      "Я ваш помічник.\n"
-      "• Пересилайте звичайні пости сюди, щоб зберегти їх у базу для повсякденного оновлення цін.\n"
-      "• Для акцій натискайте «Зробити акцію», пересилайте кілька товарів — і бот розрахує знижку!",
-      reply_markup=get_main_keyboard(user_id),
+      f"📋 Поточні налаштування:\n"
+      f"• Акція: {settings['promo']}\n"
+      f"• Знижка: {settings['discount']}%\n\n"
+      "• Пересилайте звичайні пости сюди для збереження в базу (для звичайної зміни цін за таблицею).\n"
+      "• Натискайте «🔥 Акція», щоб переслати товари і на лету отримати розрахунок знижки!",
+      reply_markup=get_main_keyboard(),
   )
 
 
-# --- НАКОПЛЕНИЕ БАЗЫ «НА ЛЕТУ» ИЛИ СБОР ДЛЯ АКЦИЙ ---
+# --- ОБРАБОТКА ФОТО (ФОНОВАЯ БАЗА ИЛИ ПЕРЕСЫЛКА ДЛЯ АКЦИЙ) ---
 @dp.message(F.photo)
 async def auto_collect_posts(message: Message, state: FSMContext):
   current_state = await state.get_state()
   user_id = message.from_user.id
 
-  # 1. Если активирован режим акции — собираем фото во временный список
+  # РЕЖИМ АКЦИИ: собираем пересланные фото во временный пакет
   if current_state == AdminStates.waiting_for_promo_photos.state:
     if not hasattr(message.bot, "promo_batch"):
       message.bot.promo_batch = {}
@@ -237,7 +237,7 @@ async def auto_collect_posts(message: Message, state: FSMContext):
   if current_state == AdminStates.waiting_for_group_table.state:
     return
 
-  # 2. Обычное фоновое сохранение в постоянную базу цен
+  # ОБЫЧНЫЙ РЕЖИМ: сохраняем в постоянную базу для цен из 1С
   caption = message.caption or ""
   code = extract_code_from_text(caption)
 
@@ -255,12 +255,13 @@ async def auto_collect_posts(message: Message, state: FSMContext):
     total_saved = sum(len(posts) for posts in group_database.values())
     await message.answer(f"✅ Товар із кодом `{code}` записано в базу! (Всього в базі: {total_saved} шт.)", parse_mode=ParseMode.MARKDOWN)
   else:
-    await message.answer("ℹ️ У тексті цього фото не знайдено рядок «Код ...». Воно не додано до бази.", reply_markup=get_main_keyboard(user_id))
+    await message.answer("ℹ️ У тексті цього фото не знайдено рядок «Код ...». Воно не додано до бази.", reply_markup=get_main_keyboard())
 
 
 @dp.message(
     F.text.in_({
         "🔄 Отримати оновлені пости за таблицею",
+        "🔥 Акція",
         "✍️ Ввести свій текст акції",
         "🔢 Ввести свій % знижки",
         "⚙️ Поточні налаштування",
@@ -278,7 +279,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
   if text == "🔄 Отримати оновлені пости за таблицею":
     total_saved = sum(len(posts) for posts in group_database.values())
     if total_saved == 0:
-      await message.answer("⚠️ База даних порожня! Перешліть пости з групи сюди.", reply_markup=get_main_keyboard(user_id))
+      await message.answer("⚠️ База даних порожня! Перешліть пости з групи сюди.", reply_markup=get_main_keyboard())
       return
 
     await state.set_state(AdminStates.waiting_for_group_table)
@@ -288,7 +289,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
         reply_markup=ReplyKeyboardRemove(),
     )
 
-  elif text.startswith("🔥 Зробити акцію"):
+  elif text == "🔥 Акція":
     if not hasattr(message.bot, "promo_batch"):
       message.bot.promo_batch = {}
     message.bot.promo_batch[user_id] = []
@@ -296,22 +297,29 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_promo_photos)
     settings = user_settings[user_id]
     await message.answer(
-        f"🔥 **Режим акції (знижка -{settings['discount']}%)**\n\n"
-        "Перешліть сюди кілька товарів (наприклад, золото або серебро), для яких робите акцію. "
-        "Коли надішлете всі, натисніть кнопку нижче ⬇️",
+        f"🔥 **Режим акції (поточна знижка: {settings['discount']}%)**\n\n"
+        "Перешліть сюди товари (наприклад, золото або срібло), для яких робите акцію. "
+        "Коли перешліть усі, натисніть кнопку нижче ⬇️",
         reply_markup=get_done_promo_keyboard(),
     )
 
   elif text == "📊 Статистика бази":
     total_saved = sum(len(posts) for posts in group_database.values())
-    await message.answer(f"📊 Статистика:\n• Загалом збережених товарів у базі: {total_saved} шт.", reply_markup=get_main_keyboard(user_id))
+    settings = user_settings[user_id]
+    await message.answer(
+        f"📊 Статистика:\n"
+        f"• Загалом збережених товарів у базі: {total_saved} шт.\n"
+        f"• Поточна акція: {settings['promo']}\n"
+        f"• Поточна знижка: {settings['discount']}%",
+        reply_markup=get_main_keyboard()
+    )
 
   elif text == "🗑 Очистити базу":
     global group_database
     group_database = {}
     if os.path.exists(DB_FILE):
       os.remove(DB_FILE)
-    await message.answer("🗑 База даних повністю очищена.", reply_markup=get_main_keyboard(user_id))
+    await message.answer("🗑 База даних повністю очищена.", reply_markup=get_main_keyboard())
 
   elif text == "✍️ Ввести свій текст акції":
     await state.set_state(AdminStates.waiting_for_custom_promo)
@@ -327,18 +335,18 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
         f"📋 Поточні налаштування:\n"
         f"• Акція: {settings['promo']}\n"
         f"• Знижка: {settings['discount']}%",
-        reply_markup=get_main_keyboard(user_id),
+        reply_markup=get_main_keyboard(),
     )
 
 
-# --- ВЫДАЧА АКЦИОННЫХ ПОСТОВ ---
+# --- ЗАВЕРШЕНИЕ И ВЫДАЧА АКЦИИ НА ЛЕТУ ---
 @dp.message(AdminStates.waiting_for_promo_photos, F.text == "✅ Готово, застосувати знижку")
 async def finish_promo_batch(message: Message, state: FSMContext):
   user_id = message.from_user.id
   batch = getattr(message.bot, "promo_batch", {}).get(user_id, [])
 
   if not batch:
-    await message.answer("❌ Ви не надіслали жодного товару для акції!", reply_markup=get_main_keyboard(user_id))
+    await message.answer("❌ Ви не надіслали жодного товару для акції!", reply_markup=get_main_keyboard())
     await state.clear()
     return
 
@@ -363,7 +371,7 @@ async def finish_promo_batch(message: Message, state: FSMContext):
   await message.answer(
       f"✅ Готово! Надіслано акційних постів: {len(batch)}\n"
       "Усі ціни зі знижкою, штрихкоди приховані — можете пересилати у групу!",
-      reply_markup=get_main_keyboard(user_id),
+      reply_markup=get_main_keyboard(),
   )
 
 
@@ -450,7 +458,7 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
   await message.answer(
       f"✅ Готово! Надіслано оновлених постів: {sent_count}\n"
       "Усі ціни оновлено за таблицею, штрихкоди приховані.",
-      reply_markup=get_main_keyboard(user_id),
+      reply_markup=get_main_keyboard(),
   )
 
 
@@ -459,7 +467,7 @@ async def save_custom_promo(message: Message, state: FSMContext):
   user_id = message.from_user.id
   user_settings[user_id]["promo"] = message.text.strip()
   await state.clear()
-  await message.answer("✅ Текст акції змінено!", reply_markup=get_main_keyboard(user_id))
+  await message.answer("✅ Текст акції змінено!", reply_markup=get_main_keyboard())
 
 
 @dp.message(AdminStates.waiting_for_custom_discount, F.text)
@@ -472,15 +480,14 @@ async def save_custom_discount(message: Message, state: FSMContext):
     return
   user_settings[user_id]["discount"] = val
   await state.clear()
-  await message.answer(f"✅ Знижку змінено на: {val}%", reply_markup=get_main_keyboard(user_id))
+  await message.answer(f"✅ Знижку змінено на: {val}%", reply_markup=get_main_keyboard())
 
 
 async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с разделением на базу цен и режим пересылки для акций...")
-  await dp.start_polling(user_settings=user_settings)
+  print("Бот запущен с простой кнопкой «Акция» и базой для цен...")
   await dp.start_polling(bot)
 
 
