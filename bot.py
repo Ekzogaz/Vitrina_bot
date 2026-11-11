@@ -61,6 +61,24 @@ def get_user_settings(user_id):
   return users_settings[uid_str]
 
 
+# Универсальная функция подсчета точного количества товаров у пользователя
+def get_user_total_count(user_id):
+  uid_str = str(user_id)
+  user_db = user_databases.get(uid_str, {})
+  if not isinstance(user_db, dict):
+    return 0
+  # Если база старого формата (содержит chat_id), конвертируем «на лету» или считаем суммарно
+  total = 0
+  for key, val in user_db.items():
+    if isinstance(val, dict) and "photo" in val:
+      # Это уже плоский формат товара
+      total += 1
+    elif isinstance(val, dict):
+      # Это старый формат с chat_id
+      total += len(val)
+  return total
+
+
 # --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 def run_dummy_web_server():
   port = int(os.environ.get("PORT", 10000))
@@ -217,7 +235,7 @@ async def cmd_start(message: Message, state: FSMContext):
       f"📋 Ваші поточні налаштування:\n"
       f"• Акція: {settings['promo']}\n"
       f"• Знижка: {settings['discount']}%\n\n"
-      "• Пересилайте звичайні пости сюди — бот автоматично захищає базу від дублікатів.\n"
+      "• Пересилайте звичайні пости сюди — база захищена від дублікатів.\n"
       "• Натискайте «🔥 Акція», щоб переслати товари і на лету отримати розрахунок знижки!",
       reply_markup=get_main_keyboard(user_id),
   )
@@ -240,7 +258,7 @@ async def collect_promo_photos(message: Message, state: FSMContext):
   await message.answer(f"✅ Додано товар для акції №{count}. Надсилайте ще або натисніть «Готово».")
 
 
-# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В ПЕРСОНАЛЬНУЮ БАЗУ (С ЗАЩИТОЙ ОТ ДУБЛИКАТОВ) ---
+# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В ПЕРСОНАЛЬНУЮ ПУЛ-БАЗУ ---
 @dp.message(F.photo)
 async def auto_collect_posts(message: Message, state: FSMContext):
   current_state = await state.get_state()
@@ -252,27 +270,33 @@ async def auto_collect_posts(message: Message, state: FSMContext):
   code = extract_code_from_text(caption)
 
   if code:
-    chat_id = str(message.chat.id)
     if user_id not in user_databases:
       user_databases[user_id] = {}
-    if chat_id not in user_databases[user_id]:
-      user_databases[user_id][chat_id] = {}
+    
+    # Поддерживаем миграцию со старого формата на плоский
+    if any(isinstance(v, dict) and not "photo" in v for v in user_databases[user_id].values()):
+      flat_dict = {}
+      for k, v in user_databases[user_id].items():
+        if isinstance(v, dict) and "photo" in v:
+          flat_dict[k] = v
+        elif isinstance(v, dict):
+          flat_dict.update(v)
+      user_databases[user_id] = flat_dict
 
-    # Проверяем, был ли уже такой товар в базе
-    is_update = code in user_databases[user_id][chat_id]
+    is_update = code in user_databases[user_id]
 
-    user_databases[user_id][chat_id][code] = {
+    user_databases[user_id][code] = {
         "photo": message.photo[-1].file_id,
         "caption": caption
     }
     save_json(DB_FILE, user_databases)
     
-    total_saved = sum(len(posts) for chats in user_databases[user_id].values() for posts in chats.values())
+    total_saved = len(user_databases[user_id])
     
     if is_update:
-      await message.answer(f"🔄 Товар із кодом `{code}` вже був у базі, його дані оновлено (дублікат не створено). Всього у базі: {total_saved} шт.", parse_mode=ParseMode.MARKDOWN)
+      await message.answer(f"🔄 Товар із кодом `{code}` вже був у базі, дані оновлено. Всього у базі: **{total_saved} шт.**", parse_mode=ParseMode.MARKDOWN)
     else:
-      await message.answer(f"✅ Товар із кодом `{code}` успішно додано до бази! (Всього у вашій базі: {total_saved} шт.)", parse_mode=ParseMode.MARKDOWN)
+      await message.answer(f"✅ Товар із кодом `{code}` успішно додано! Всього у базі: **{total_saved} шт.**", parse_mode=ParseMode.MARKDOWN)
   else:
     await message.answer("ℹ️ У тексті цього фото не знайдено рядок «Код ...». Воно не додано до бази.", reply_markup=get_main_keyboard(message.from_user.id))
 
@@ -293,8 +317,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
   text = message.text
   settings = get_user_settings(message.from_user.id)
 
-  user_db = user_databases.get(user_id, {})
-  total_saved = sum(len(posts) for chats in user_db.values() for posts in chats.values()) if user_db else 0
+  total_saved = get_user_total_count(user_id)
 
   if text == "🔄 Отримати оновлені пости за таблицею":
     if total_saved == 0:
@@ -305,7 +328,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     await message.answer(
         f"📥 У вашій базі даних збережено виробів: **{total_saved} шт.**\n\n"
         "Надішліть файл Excel (`.xlsx`) або скопіюйте текст із таблиці ціноутворення 1С.\n"
-        "*(Після оновлення все, чого немає в цій таблиці, автоматично видалиться з бази як продане)*",
+        "*(Після оновлення все, чого немає в цій таблиці, автоматично видалиться як продане)*",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -325,7 +348,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
   elif text == "📊 Статистика бази":
     await message.answer(
         f"📊 Статистика:\n"
-        f"• Загалом збережених товарів у вашій базі: {total_saved} шт.\n"
+        f"• Загалом збережених товарів у вашій базі: **{total_saved} шт.**\n"
         f"• Ваша поточна акція: {settings['promo']}\n"
         f"• Ваша поточна знижка: {settings['discount']}%",
         reply_markup=get_main_keyboard(message.from_user.id)
@@ -390,7 +413,7 @@ async def finish_promo_batch(message: Message, state: FSMContext):
   )
 
 
-# --- ОБРАБОТКА ТАБЛИЦЫ 1С: ОБНОВЛЕНИЕ ЦЕН И АВТОМАТИЧЕСКАЯ ОЧИСТКА ПРОДАННОГО ---
+# --- ОБРАБОТКА ТАБЛИЦЫ 1С: ОБНОВЛЕНИЕ ЦЕН И АВТОМАТИЧЕСКАЯ ОЧИСТКА ---
 @dp.message(AdminStates.waiting_for_group_table, F.document | F.text)
 async def process_table_and_send_posts(message: Message, state: FSMContext):
   user_id = str(message.from_user.id)
@@ -453,34 +476,38 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
 
   sent_count = 0
   user_db = user_databases.get(user_id, {})
+  
+  # Приводим к единому плоскому словарю для корректной фильтрации
+  flat_posts = {}
+  for k, v in user_db.items():
+    if isinstance(v, dict) and "photo" in v:
+      flat_posts[k] = v
+    elif isinstance(v, dict):
+      flat_posts.update(v)
+
   new_user_db = {}
   removed_count = 0
 
-  for chat_id, posts in user_db.items():
-    new_user_db[chat_id] = {}
-    for code, post_info in posts.items():
-      # Оставляем в базе ТОЛЬКО то, что есть в свежей таблице 1С
-      if code in price_database:
-        new_price = price_database[code]
-        cleaned_caption = update_price_and_clean_caption(post_info["caption"], new_price)
+  for code, post_info in flat_posts.items():
+    if code in price_database:
+      new_price = price_database[code]
+      cleaned_caption = update_price_and_clean_caption(post_info["caption"], new_price)
 
-        # Сохраняем товар в обновленной чистой базе
-        new_user_db[chat_id][code] = post_info
+      new_user_db[code] = post_info
 
-        try:
-          await bot.send_photo(
-              chat_id=message.from_user.id,
-              photo=post_info["photo"],
-              caption=cleaned_caption
-          )
-          sent_count += 1
-          await asyncio.sleep(0.3)
-        except Exception as e:
-          logging.error(f"Ошибка отправки поста: {e}")
-      else:
-        removed_count += 1
+      try:
+        await bot.send_photo(
+            chat_id=message.from_user.id,
+            photo=post_info["photo"],
+            caption=cleaned_caption
+        )
+        sent_count += 1
+        await asyncio.sleep(0.3)
+      except Exception as e:
+        logging.error(f"Ошибка отправки поста: {e}")
+    else:
+      removed_count += 1
 
-  # Перезаписываем базу пользователя, удаляя проданные/отсутствующие позиции
   user_databases[user_id] = new_user_db
   save_json(DB_FILE, user_databases)
 
@@ -489,7 +516,7 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
       f"✅ Готово!\n"
       f"• Надіслано оновлених постів: {sent_count}\n"
       f"• Видалено з бази (продано / немає в 1С): {removed_count} шт.\n\n"
-      "База повністю синхронізована з актуальними даними 1С!",
+      f"У вашій базі тепер актуальних товарів: **{len(new_user_db)} шт.**",
       reply_markup=get_main_keyboard(message.from_user.id),
   )
 
@@ -521,7 +548,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с защитой от дубликатов и автоочисткой по 1С...")
+  print("Бот с точным подсчетом статистики запущен...")
   await dp.start_polling(bot)
 
 
