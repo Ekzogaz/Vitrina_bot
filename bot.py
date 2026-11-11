@@ -1,6 +1,5 @@
 import asyncio
 import http.server
-import io
 import logging
 import os
 import re
@@ -16,7 +15,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-import openpyxl  # Библиотека для чтения Excel файлов
 
 # Токен вашего бота
 TOKEN = "9085949690:AAGAQLcj2ZBEG0FU1tqcHT6SZBm73w-gHtk"
@@ -58,7 +56,7 @@ class AdminStates(StatesGroup):
   waiting_for_custom_promo = State()
   waiting_for_custom_discount = State()
   waiting_for_batch_photos = State()
-  waiting_for_table_file = State()
+  waiting_for_table_data = State()
 
 
 def get_main_keyboard():
@@ -83,19 +81,19 @@ def get_main_keyboard():
 def get_done_keyboard():
   keyboard = ReplyKeyboardMarkup(
       keyboard=[
-          [KeyboardButton(text="✅ Готово, завантажити файл з цінами")]
+          [KeyboardButton(text="✅ Готово, завантажити таблицю")]
       ],
       resize_keyboard=True,
   )
   return keyboard
 
 
-# Функция обновления цены в тексте поста
+# Функция обновления цены в тексте поста (меняет только цену, остальное не трогает)
 def update_price_in_caption(caption: str, new_price: float, discount_percent: float, promo_header: str) -> str:
   if not caption:
     caption = ""
 
-  # Считаем акционную цену с учетом округления до целых
+  # Считаем акционную цену с округлением до целых
   auction_price = round(new_price * (1 - discount_percent / 100))
   
   pattern = r"(Ціна\s*:?\s*)(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.|грнн)?\b"
@@ -113,20 +111,42 @@ def update_price_in_caption(caption: str, new_price: float, discount_percent: fl
   if not price_found:
     updated_text += f"\n\n🔥 Акційна ціна: {auction_price} грн"
 
-  # Если есть заголовок акции, добавляем его сверху, если его еще нет
   if promo_header and promo_header not in updated_text:
     return f"🚨 {promo_header} 🚨\n\n{updated_text}"
   
   return updated_text
 
 
-# Функция поиска ИД (артикула) в тексте описания поста
-def extract_id_from_text(text: str):
+# Функция извлечения характеристик (проба, вес, размер) из текста
+def extract_specs(text: str):
   if not text:
-    return None
-  # Ищем последовательность из 12 цифр (ИД из колонки А, например 000092120426)
-  match = re.search(r"\b(\d{12})\b", text)
-  return match.group(1) if match else None
+    return None, None, 0.0
+  
+  text_lower = text.lower()
+  
+  # Ищем пробу (3 цифры, например 585)
+  purity_match = re.search(r"\b(\d{3})\b", text_lower)
+  purity = purity_match.group(1) if purity_match else None
+
+  # Ищем вес (число с точкой или запятой перед 'г' или в тексте)
+  weight = None
+  weight_match = re.search(r"(\d+[\.,]\d+|\d+)\s*(?:г\b|грам)", text_lower)
+  if weight_match:
+    try:
+      weight = float(weight_match.group(1).replace(",", "."))
+    except ValueError:
+      pass
+
+  # Ищем размер (если есть, например 17 или 17.5)
+  size = 0.0
+  size_match = re.search(r"(?:розмір\D*)?(\d+[\.,]?\d*)\s*(?:см|мм)?\b", text_lower)
+  if size_match and not weight_match: # Убеждаемся что это не вес
+    try:
+      size = float(size_match.group(1).replace(",", "."))
+    except ValueError:
+      pass
+
+  return purity, weight, size
 
 
 @dp.message(Command("start"))
@@ -142,7 +162,7 @@ async def cmd_start(message: Message, state: FSMContext):
   settings = user_settings[user_id]
   await message.answer(
       "Привіт! 👋\n\n"
-      "Я бот для пакетного оновлення цін за унікальним ІД з таблиць 1С.\n"
+      "Я бот для оновлення цін за характеристиками (проба, вага, розмір).\n"
       f"📋 Поточні налаштування:\n"
       f"• Акція: {settings['promo']}\n"
       f"• Знижка: {settings['discount']}%\n\n"
@@ -174,8 +194,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_batch_photos)
     await message.answer(
         "📥 **Крок 1 з 2:**\n"
-        "Перешліть або надішліть сюди пачку фотографій з описами виробів (наприклад, з «Ізбранного»). "
-        "В описі кожного фото обов'язково має бути унікальний **ІД** (артикул з колонки А).\n\n"
+        "Перешліть або надішліть сюди пачку фотографій з описами виробів (з «Ізбранного»).\n\n"
         "Коли надішлете всі фото, натисніть кнопку нижче ⬇️",
         reply_markup=get_done_keyboard(),
     )
@@ -212,7 +231,7 @@ async def collect_photos(message: Message):
   await message.answer(f"✅ Збережено фото №{count}. Продовжуйте надсилати або натисніть «Готово».")
 
 
-@dp.message(AdminStates.waiting_for_batch_photos, F.text == "✅ Готово, завантажити файл з цінами")
+@dp.message(AdminStates.waiting_for_batch_photos, F.text == "✅ Готово, завантажити таблицю")
 async def finish_photos_collection(message: Message, state: FSMContext):
   user_id = message.from_user.id
   photos = user_batch_photos.get(user_id, [])
@@ -221,103 +240,80 @@ async def finish_photos_collection(message: Message, state: FSMContext):
     await message.answer("❌ Ви не надали жодного фото! Надішліть хоча б одне фото.")
     return
 
-  await state.set_state(AdminStates.waiting_for_table_file)
+  await state.set_state(AdminStates.waiting_for_table_data)
   await message.answer(
       f"📥 Отримано фото: **{len(photos)} шт.**\n\n"
       "**Крок 2 з 2:**\n"
-      "Тепер надішліть сюди файл Excel (`.xlsx`) із таблицею цін або просто скопіюйте колонки з таблиці і надішліть текстом.",
+      "Тепер просто **скопіюйте дані з таблиці в LibreOffice/Excel** (де є Проба, Розмір, Вага, Ціна) та **надішліть цей текст сюди**.",
       reply_markup=ReplyKeyboardRemove(),
   )
 
 
-# Обработка файла `.xlsx` или текста с таблицей
-@dp.message(AdminStates.waiting_for_table_file, F.document | F.text)
-async def process_table_document_or_text(message: Message, state: FSMContext):
+# Обработка скопированного текста из таблицы 1С
+@dp.message(AdminStates.waiting_for_table_data, F.text)
+async def process_table_text(message: Message, state: FSMContext):
   user_id = message.from_user.id
+  table_text = message.text
   photos = user_batch_photos.get(user_id, [])
   settings = user_settings.get(user_id, {"promo": "АКЦІЙНА ПРОПОЗИЦІЯ", "discount": 5.0})
 
   promo_text = settings["promo"]
   discount_percent = settings["discount"]
 
-  price_database = {}  # { '000092120426': 2133.0 }
-
-  # Если прислали файл (например .xlsx)
-  if message.document:
-    file_info = await bot.get_file(message.document.file_id)
-    downloaded_file = await bot.download_file(file_info.file_path)
+  # Парсим строки из вставленного текста
+  table_rows = []
+  lines = table_text.split("\n")
+  for line in lines:
+    purity, weight, size = extract_specs(line)
     
-    try:
-      wb = openpyxl.load_workbook(io.BytesIO(downloaded_file.read()), data_only=True)
-      sheet = wb.active
-      for row in sheet.iter_rows(values_only=True):
-        # Ищем ИД в первой колонке (индекс 0) и цену в последней/нужной (ищем число)
-        row_str_values = [str(cell) for cell in row if cell is not None]
-        if not row_str_values:
-          continue
-        
-        # Ищем ИД (12 цифр)
-        item_id = None
-        item_price = None
-        for val in row_str_values:
-          if re.fullmatch(r"\d{12}", val.strip()):
-            item_id = val.strip()
+    # Ищем цену (число больше 10 в строке)
+    prices = re.findall(r"\b\d+[\.,]?\d*\b", line.replace(" ", ""))
+    price = None
+    if prices:
+      for p_str in reversed(prices):
+        try:
+          val = float(p_str.replace(",", "."))
+          if val > 10:  # Цены изделий больше 10 грн
+            price = val
             break
-        
-        # Ищем цену (число больше 10)
-        for val in reversed(row_str_values):
-          val_clean = val.replace(" ", "").replace(",", ".")
-          try:
-            num = float(val_clean)
-            if num > 10:
-              item_price = num
-              break
-          except ValueError:
-            continue
+        except ValueError:
+          continue
 
-        if item_id and item_price:
-          price_database[item_id] = item_price
-    except Exception as e:
-      await message.answer(f"❌ Помилка читання файлу Excel: {e}")
-      return
+    if purity and weight and price:
+      table_rows.append({"purity": purity, "weight": weight, "size": size, "price": price})
 
-  elif message.text:
-    # Если прислали текстом
-    lines = message.text.split("\n")
-    for line in lines:
-      match_id = re.search(r"\b(\d{12})\b", line)
-      if match_id:
-        item_id = match_id.group(1)
-        prices = re.findall(r"\b\d+[\.,]?\d*\b", line.replace(" ", ""))
-        if prices:
-          try:
-            item_price = float(prices[-1].replace(",", "."))
-            price_database[item_id] = item_price
-          except ValueError:
-            continue
-
-  if not price_database:
-    await message.answer("❌ Не вдалося знайти дані ІД та ціни у надісланому файлі/тексті. Спробуйте ще раз.")
+  if not table_rows:
+    await message.answer("❌ Не вдалося розпізнати дані у надісланому тексті. Переконайтеся, що скопіювали таблицю правильно.")
     return
 
-  await message.answer(f"🔍 Оброблено рядків з цінами: {len(price_database)}. Оновлюю товари...")
+  await message.answer(f"🔍 Шукаю збіги для {len(photos)} виробів за пробою, вагою та розміром...")
 
   matched_count = 0
 
   for item in photos:
     caption = item["caption"]
-    item_id = extract_id_from_text(caption)
+    p_purity, p_weight, p_size = extract_specs(caption)
 
     found_price = None
-    if item_id and item_id in price_database:
-      found_price = price_database[item_id]
-      matched_count += 1
+    if p_purity and p_weight is not None:
+      # Ищем соответствие в таблице (проба должна совпасть точно, вес с погрешностью до 0.02 г)
+      for row in table_rows:
+        if row["purity"] == p_purity and row["weight"] is not None:
+          if abs(row["weight"] - p_weight) <= 0.02:
+            # Если в посте указан размер, сверяем и его
+            if p_size > 0 and row["size"] > 0:
+              if abs(row["size"] - p_size) <= 0.2:
+                found_price = row["price"]
+                break
+            else:
+              found_price = row["price"]
+              break
 
-    # Если нашли цену в таблице — обновляем только её, название и остальное не трогаем
     if found_price is not None:
       new_caption = update_price_in_caption(caption, found_price, discount_percent, promo_text)
+      matched_count += 1
     else:
-      new_caption = caption  # Если ИД не найдено в таблице, оставляем текст без изменений
+      new_caption = caption  # Если збіг не найден, оставляем текст без изменений
 
     await bot.send_photo(
         chat_id=message.from_user.id,
@@ -330,7 +326,7 @@ async def process_table_document_or_text(message: Message, state: FSMContext):
 
   await message.answer(
       f"✅ Готово! Оброблено виробів: {len(photos)}\n"
-      f"🎯 Знайдено за ІД та оновлено цін: {matched_count}\n\n"
+      f"🎯 Успішно оновлено за характеристиками: {matched_count}\n\n"
       "Усі готові посты вище можна переслати в групу!",
       reply_markup=get_main_keyboard(),
   )
@@ -361,7 +357,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с поиском по уникальному ИД...")
+  print("Бот запущен с поиском по характеристикам...")
   await dp.start_polling(bot)
 
 
