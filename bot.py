@@ -16,7 +16,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-import openpyxl  # Библиотека для чтения Excel файлов
+import openpyxl
 
 # Токен вашего бота
 TOKEN = "9085949690:AAGAQLcj2ZBEG0FU1tqcHT6SZBm73w-gHtk"
@@ -24,6 +24,7 @@ TOKEN = "9085949690:AAGAQLcj2ZBEG0FU1tqcHT6SZBm73w-gHtk"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Словарь для хранения настроек пользователей
 user_settings = {}
 user_batch_photos = {}  # {user_id: [list of dicts with photo_id and caption]}
 
@@ -90,7 +91,7 @@ def get_done_keyboard():
   return keyboard
 
 
-# Нормализация кода (штрихкода): убираем ведущие нули и пробелы для точного сравнения
+# Нормализация кода для табличного обновления
 def normalize_code(code_str: str) -> str:
   if not code_str:
     return ""
@@ -98,14 +99,55 @@ def normalize_code(code_str: str) -> str:
   return clean_digits.lstrip("0")
 
 
-# Функция обновления цены и удаления строки с кодом для чистоты поста
-def update_price_and_clean_code(caption: str, new_price: float) -> str:
+# Логика для обычных акций (считает скидку, зачеркивает цену, добавляет заголовок акции)
+def apply_auction_logic(text: str, promo_header: str, discount_percent: float) -> str:
+  if not text:
+    text = ""
+
+  pattern = r"(Ціна\s*:?\s*)(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.|грнн)?\b"
+  price_found = False
+
+  def replace_price(match):
+    nonlocal price_found
+    raw_number = match.group(2).replace(" ", "").replace(",", ".")
+    try:
+      price = float(raw_number)
+      if price <= 0:
+        return match.group(0)
+
+      price_found = True
+      new_price = price * (1 - discount_percent / 100)
+      new_price_formatted = round(new_price)
+
+      currency = match.group(3) or "грн"
+      original_full = match.group(0)
+
+      return (
+          f"~~{original_full}~~"
+          f"\n\n🔥 Акційна ціна: {new_price_formatted} {currency}"
+      )
+    except ValueError:
+      return match.group(0)
+
+  updated_text = re.sub(pattern, replace_price, text, count=1, flags=re.IGNORECASE)
+
+  if not price_found:
+    updated_text += f"\n\n🔥 Акційна ціна зі знижкою -{discount_percent}%"
+
+  # Добавляем заголовок акции сверху, если его еще нет
+  if promo_header and promo_header not in updated_text:
+    return f"🚨 {promo_header} 🚨\n\n{updated_text}"
+  
+  return updated_text
+
+
+# Прямая замена цены для табличного режима (без скидок, с удалением строки кода)
+def update_price_straight(caption: str, new_price: float) -> str:
   if not caption:
     caption = ""
 
   formatted_new_price = f"{round(new_price):,}".replace(",", " ")
   
-  # 1. Заменяем цену
   pattern = r"(Ціна\s*:?\s*)(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.|грнн)?\b"
   price_found = False
 
@@ -121,17 +163,14 @@ def update_price_and_clean_code(caption: str, new_price: float) -> str:
   if not price_found:
     updated_text += f"\n\nЦіна {formatted_new_price} грн"
 
-  # 2. Удаляем строчку с кодом/штрихкодом, чтобы клиенты её не видели
-  # Удаляет строки вида "Код 1000286006719", "Штрихкод: 0000...", etc.
+  # Удаляем строчку с кодом/штрихкодом для клиентов
   updated_text = re.sub(r"^(код|штрихкод)\s*[:\-]?\s*\d+\s*$", "", updated_text, flags=re.IGNORECASE | re.MULTILINE)
-  
-  # Убираем возможные лишние пустые строки после удаления
   updated_text = re.sub(r"\n\s*\n\s*\n", "\n\n", updated_text).strip()
 
   return updated_text
 
 
-# Извлечение штрихкода/кода из текста поста для поиска
+# Извлечение кода из текста поста
 def extract_code_from_text(text: str):
   if not text:
     return None
@@ -159,7 +198,7 @@ async def cmd_start(message: Message, state: FSMContext):
   settings = user_settings[user_id]
   await message.answer(
       "Привіт! 👋\n\n"
-      "Я бот для оновлення цін за штрихкодом (код у постах буде автоматично приховано для клієнтів).\n"
+      "Я бот для управління акціями та оновлення цін.\n"
       f"📋 Поточні налаштування:\n"
       f"• Акція: {settings['promo']}\n"
       f"• Знижка: {settings['discount']}%\n\n"
@@ -168,6 +207,7 @@ async def cmd_start(message: Message, state: FSMContext):
   )
 
 
+# Обработка кнопок главного меню
 @dp.message(
     F.text.in_({
         "🔄 Обновити ціни за таблицею",
@@ -190,9 +230,9 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     user_batch_photos[user_id] = []
     await state.set_state(AdminStates.waiting_for_batch_photos)
     await message.answer(
-        "📥 **Крок 1 з 2:**\n"
+        "📥 **Режим оновлення за таблицею (Крок 1):**\n"
         "Перешліть або надішліть сюди пачку фотографій з описами виробів (з «Ізбранного»). "
-        "У кожному описі має бути рядок **Код ...** (для пошуку).\n\n"
+        "У кожному описі має бути рядок **Код ...**\n\n"
         "Коли надішлете всі фото, натисніть кнопку нижче ⬇️",
         reply_markup=get_done_keyboard(),
     )
@@ -215,6 +255,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     )
 
 
+# Шаг 1 табличного режима: сбор фото
 @dp.message(AdminStates.waiting_for_batch_photos, F.photo)
 async def collect_photos(message: Message):
   user_id = message.from_user.id
@@ -229,6 +270,7 @@ async def collect_photos(message: Message):
   await message.answer(f"✅ Збережено фото №{count}. Продовжуйте надсилати або натисніть «Готово».")
 
 
+# Кнопка завершения сбора фото для табличного режима
 @dp.message(AdminStates.waiting_for_batch_photos, F.text == "✅ Готово, надіслати таблицю / текст")
 async def finish_photos_collection(message: Message, state: FSMContext):
   user_id = message.from_user.id
@@ -241,21 +283,20 @@ async def finish_photos_collection(message: Message, state: FSMContext):
   await state.set_state(AdminStates.waiting_for_table_input)
   await message.answer(
       f"📥 Отримано фото: **{len(photos)} шт.**\n\n"
-      "**Крок 2 з 2:**\n"
-      "Тепер просто **надішліть сюди файл Excel (`.xlsx`)** АБО **скопіюйте і вставте текст із таблиці** (штрихкод та ціна).",
+      "**Режим оновлення за таблицею (Крок 2):**\n"
+      "Тепер **надішліть сюди файл Excel (`.xlsx`)** АБО **скопіюйте і вставте текст із таблиці** (код та ціна).",
       reply_markup=ReplyKeyboardRemove(),
   )
 
 
-# Универсальный обработчик таблиц/текста
+# Обработка таблицы/текста в табличном режиме
 @dp.message(AdminStates.waiting_for_table_input, F.document | F.text)
 async def process_table_input(message: Message, state: FSMContext):
   user_id = message.from_user.id
   photos = user_batch_photos.get(user_id, [])
 
-  price_database = {}  # { нормалізований_штрихкод: ціна }
+  price_database = {}
 
-  # 1. Обработка файла Excel
   if message.document:
     file_info = await bot.get_file(message.document.file_id)
     downloaded_file = await bot.download_file(file_info.file_path)
@@ -288,7 +329,6 @@ async def process_table_input(message: Message, state: FSMContext):
       await message.answer(f"❌ Помилка читання файлу: {e}")
       return
 
-  # 2. Обработка текста
   elif message.text:
     lines = message.text.split("\n")
     for line in lines:
@@ -306,10 +346,10 @@ async def process_table_input(message: Message, state: FSMContext):
           continue
 
   if not price_database:
-    await message.answer("❌ Не вдалося розпізнати штрихкоди та ціни. Перевірте дані та спробуйте ще раз.")
+    await message.answer("❌ Не вдалося розпізнати штрихкоди та ціни. Перевірте дані.")
     return
 
-  await message.answer(f"🔍 Оброблено позицій: {len(price_database)}. Шукаю збіги та оновлюю порти...")
+  await message.answer(f"🔍 Оброблено позицій: {len(price_database)}. Шукаю збіги...")
 
   matched_count = 0
 
@@ -323,10 +363,8 @@ async def process_table_input(message: Message, state: FSMContext):
       matched_count += 1
 
     if found_price is not None:
-      # Обновляем цену и автоматически удаляем строку с кодом
-      new_caption = update_price_and_clean_code(caption, found_price)
+      new_caption = update_price_straight(caption, found_price)
     else:
-      # Если код не найден, просто убираем строку с кодом на всякий случай или оставляем
       new_caption = caption
 
     await bot.send_photo(
@@ -341,37 +379,91 @@ async def process_table_input(message: Message, state: FSMContext):
   await message.answer(
       f"✅ Готово! Оброблено виробів: {len(photos)}\n"
       f"🎯 Успішно оновлено: {matched_count}\n\n"
-      "Усі готові посты вище тепер без службових кодів — можете сміливо пересилати їх у групу!",
+      "Можете пересилати порти в групу!",
       reply_markup=get_main_keyboard(),
   )
 
 
+# --- ОБЫЧНЫЙ РЕЖИМ АКЦИЙ (КОГДА КИДАЮТ ФОТО ПРОСТО ТАК С НАСТРОЕННОЙ СКИДКОЙ) ---
+@dp.message(F.photo)
+async def handle_regular_photos(message: Message, state: FSMContext):
+  # Если пользователь случайно попал сюда в состоянии ожидания таблиц — игнорируем
+  current_state = await state.get_state()
+  if current_state in [AdminStates.waiting_for_batch_photos.state, AdminStates.waiting_for_table_input.state]:
+    return
+
+  user_id = message.from_user.id
+  settings = user_settings.get(
+      user_id, {"promo": "АКЦІЙНА ПРОПОЗИЦІЯ", "discount": 5.0}
+  )
+
+  promo_text = settings["promo"]
+  discount_percent = settings["discount"]
+
+  original_caption = message.caption or ""
+  new_caption = apply_auction_logic(
+      original_caption, promo_text, discount_percent
+  )
+  photo_id = message.photo[-1].file_id
+
+  await bot.send_photo(
+      chat_id=message.from_user.id,
+      photo=photo_id,
+      caption=new_caption,
+      reply_markup=get_main_keyboard(),
+  )
+
+
+# Сохранение текста акции
 @dp.message(AdminStates.waiting_for_custom_promo, F.text)
 async def save_custom_promo(message: Message, state: FSMContext):
   user_id = message.from_user.id
-  user_settings[user_id]["promo"] = message.text.strip()
+  new_promo = message.text.strip()
+
+  if user_id not in user_settings:
+    user_settings[user_id] = {"promo": new_promo, "discount": 5.0}
+  else:
+    user_settings[user_id]["promo"] = new_promo
+
   await state.clear()
-  await message.answer("✅ Текст акції змінено!", reply_markup=get_main_keyboard())
+  await message.answer(
+      f"✅ Текст акції змінено на:\n{new_promo}\n\n"
+      "Тепер можете просто кидати фотографії з описами, і бот застосує цю акцію зі знижкою!",
+      reply_markup=get_main_keyboard(),
+  )
 
 
+# Сохранение процента скидки
 @dp.message(AdminStates.waiting_for_custom_discount, F.text)
 async def save_custom_discount(message: Message, state: FSMContext):
   user_id = message.from_user.id
   try:
-    val = float(message.text.strip().replace(",", "."))
+    new_discount = float(message.text.strip().replace(",", "."))
   except ValueError:
-    await message.answer("❌ Введіть число:")
+    await message.answer("❌ Введіть лише число (наприклад: 5 або 10.5):")
     return
-  user_settings[user_id]["discount"] = val
+
+  if user_id not in user_settings:
+    user_settings[user_id] = {
+        "promo": "АКЦІЙНА ПРОПОЗИЦІЯ",
+        "discount": new_discount,
+    }
+  else:
+    user_settings[user_id]["discount"] = new_discount
+
   await state.clear()
-  await message.answer(f"✅ Знижку змінено на: {val}%", reply_markup=get_main_keyboard())
+  await message.answer(
+      f"✅ Розмір знижки змінено на: {new_discount}%\n\n"
+      "Тепер можете кидати фотографії, і бот розрахує нову ціну!",
+      reply_markup=get_main_keyboard(),
+  )
 
 
 async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с автоматическим скрытием кодов в постах...")
+  print("Бот запущен с поддержкой и акций со скидкой, и табличного обновления!")
   await dp.start_polling(bot)
 
 
