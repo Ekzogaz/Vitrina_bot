@@ -270,6 +270,7 @@ async def auto_collect_posts(message: Message, state: FSMContext):
     })
 )
 async def handle_menu_buttons(message: Message, state: FSMContext):
+  global group_database
   user_id = message.from_user.id
   text = message.text
 
@@ -315,7 +316,6 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     )
 
   elif text == "🗑 Очистити базу":
-    global group_database
     group_database = {}
     if os.path.exists(DB_FILE):
       os.remove(DB_FILE)
@@ -487,7 +487,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с простой кнопкой «Акция» и базой для цен...")
+  print("Бот запущен успешно...")
   await dp.start_polling(bot)
 
 
