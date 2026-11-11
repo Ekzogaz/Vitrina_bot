@@ -98,13 +98,14 @@ def normalize_code(code_str: str) -> str:
   return clean_digits.lstrip("0")
 
 
-# Прямая замена цены в тексте поста
-def update_price_straight(caption: str, new_price: float) -> str:
+# Функция обновления цены и удаления строки с кодом для чистоты поста
+def update_price_and_clean_code(caption: str, new_price: float) -> str:
   if not caption:
     caption = ""
 
   formatted_new_price = f"{round(new_price):,}".replace(",", " ")
   
+  # 1. Заменяем цену
   pattern = r"(Ціна\s*:?\s*)(\d[\d\s]*[\.,]?\d*)\s*(грн|uah|₴|грн\.|грнн)?\b"
   price_found = False
 
@@ -120,10 +121,17 @@ def update_price_straight(caption: str, new_price: float) -> str:
   if not price_found:
     updated_text += f"\n\nЦіна {formatted_new_price} грн"
 
+  # 2. Удаляем строчку с кодом/штрихкодом, чтобы клиенты её не видели
+  # Удаляет строки вида "Код 1000286006719", "Штрихкод: 0000...", etc.
+  updated_text = re.sub(r"^(код|штрихкод)\s*[:\-]?\s*\d+\s*$", "", updated_text, flags=re.IGNORECASE | re.MULTILINE)
+  
+  # Убираем возможные лишние пустые строки после удаления
+  updated_text = re.sub(r"\n\s*\n\s*\n", "\n\n", updated_text).strip()
+
   return updated_text
 
 
-# Извлечение штрихкода/кода из текста поста
+# Извлечение штрихкода/кода из текста поста для поиска
 def extract_code_from_text(text: str):
   if not text:
     return None
@@ -151,7 +159,7 @@ async def cmd_start(message: Message, state: FSMContext):
   settings = user_settings[user_id]
   await message.answer(
       "Привіт! 👋\n\n"
-      "Я бот для оновлення цін за штрихкодом.\n"
+      "Я бот для оновлення цін за штрихкодом (код у постах буде автоматично приховано для клієнтів).\n"
       f"📋 Поточні налаштування:\n"
       f"• Акція: {settings['promo']}\n"
       f"• Знижка: {settings['discount']}%\n\n"
@@ -183,7 +191,8 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_batch_photos)
     await message.answer(
         "📥 **Крок 1 з 2:**\n"
-        "Перешліть або надішліть сюди пачку фотографій з описами виробів (з «Ізбранного»).\n\n"
+        "Перешліть або надішліть сюди пачку фотографій з описами виробів (з «Ізбранного»). "
+        "У кожному описі має бути рядок **Код ...** (для пошуку).\n\n"
         "Коли надішлете всі фото, натисніть кнопку нижче ⬇️",
         reply_markup=get_done_keyboard(),
     )
@@ -238,7 +247,7 @@ async def finish_photos_collection(message: Message, state: FSMContext):
   )
 
 
-# Универсальный обработчик: принимает либо файл (.xlsx), либо скопированный текст
+# Универсальный обработчик таблиц/текста
 @dp.message(AdminStates.waiting_for_table_input, F.document | F.text)
 async def process_table_input(message: Message, state: FSMContext):
   user_id = message.from_user.id
@@ -246,7 +255,7 @@ async def process_table_input(message: Message, state: FSMContext):
 
   price_database = {}  # { нормалізований_штрихкод: ціна }
 
-  # 1. Если прислали файл документа (.xlsx)
+  # 1. Обработка файла Excel
   if message.document:
     file_info = await bot.get_file(message.document.file_id)
     downloaded_file = await bot.download_file(file_info.file_path)
@@ -260,7 +269,6 @@ async def process_table_input(message: Message, state: FSMContext):
         if not row_values:
           continue
         
-        # Ищем штрихкод в первой колонке, цену в любой из правых колонок
         raw_code = str(row_values[0]).strip()
         norm_code = normalize_code(raw_code)
 
@@ -280,7 +288,7 @@ async def process_table_input(message: Message, state: FSMContext):
       await message.answer(f"❌ Помилка читання файлу: {e}")
       return
 
-  # 2. Если прислали текстом
+  # 2. Обработка текста
   elif message.text:
     lines = message.text.split("\n")
     for line in lines:
@@ -301,7 +309,7 @@ async def process_table_input(message: Message, state: FSMContext):
     await message.answer("❌ Не вдалося розпізнати штрихкоди та ціни. Перевірте дані та спробуйте ще раз.")
     return
 
-  await message.answer(f"🔍 Оброблено позицій: {len(price_database)}. Шукаю збіги за штрихкодом...")
+  await message.answer(f"🔍 Оброблено позицій: {len(price_database)}. Шукаю збіги та оновлюю порти...")
 
   matched_count = 0
 
@@ -315,9 +323,11 @@ async def process_table_input(message: Message, state: FSMContext):
       matched_count += 1
 
     if found_price is not None:
-      new_caption = update_price_straight(caption, found_price)
+      # Обновляем цену и автоматически удаляем строку с кодом
+      new_caption = update_price_and_clean_code(caption, found_price)
     else:
-      new_caption = caption  # Если штрихкод не найден, текст не меняем
+      # Если код не найден, просто убираем строку с кодом на всякий случай или оставляем
+      new_caption = caption
 
     await bot.send_photo(
         chat_id=message.from_user.id,
@@ -330,8 +340,8 @@ async def process_table_input(message: Message, state: FSMContext):
 
   await message.answer(
       f"✅ Готово! Оброблено виробів: {len(photos)}\n"
-      f"🎯 Успішно оновлено за штрихкодом: {matched_count}\n\n"
-      "Усі готові посты вище можна переслати в групу!",
+      f"🎯 Успішно оновлено: {matched_count}\n\n"
+      "Усі готові посты вище тепер без службових кодів — можете сміливо пересилати їх у групу!",
       reply_markup=get_main_keyboard(),
   )
 
@@ -361,7 +371,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с универсальным приемом файлов и текста...")
+  print("Бот запущен с автоматическим скрытием кодов в постах...")
   await dp.start_polling(bot)
 
 
