@@ -26,23 +26,24 @@ dp = Dispatcher()
 user_settings = {}
 
 
-# --- ВСТРОЕННЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+# --- УПРОЩЕННЫЙ И СВЕРХБЫСТРЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
 def run_dummy_web_server():
   port = int(os.environ.get("PORT", 10000))
 
-  class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+  class FastHealthHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
       self.send_response(200)
+      self.send_header("Content-type", "text/plain; charset=utf-8")
       self.end_headers()
-      self.wfile.write(b"Bot is alive and running!")
+      self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-      pass
+      pass  # Убираем лишний мусор из логов
 
   server_address = ("0.0.0.0", port)
-  httpd = http.server.HTTPServer(server_address, HealthCheckHandler)
-  print(f"Веб-заглушка запущена на порту {port}")
+  httpd = http.server.HTTPServer(server_address, FastHealthHandler)
+  print(f"Быстрый веб-сервер запущен на порту {port}")
   httpd.serve_forever()
 
 
@@ -92,13 +93,12 @@ def apply_auction_logic(
 
       price_found = True
       new_price = price * (1 - discount_percent / 100)
-      # Округляем до ближайшего целого числа (без знаков после запятой)
+      # Округляем до ближайшего целого числа
       new_price_formatted = round(new_price)
 
       currency = match.group(3) or "грн"
       original_full = match.group(0)
 
-      # Убрали процент в скобках, оставили только чистую акционную цену
       return (
           f"~~{original_full}~~"
           f"\n\n🔥 Акційна ціна: {new_price_formatted} {currency}"
@@ -257,7 +257,7 @@ async def main():
 
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот запущен с округлением цен и компактным меню...")
+  print("Бот запущен с оптимизированным сервером...")
   await dp.start_polling(bot)
 
 
