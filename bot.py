@@ -127,10 +127,23 @@ def get_main_keyboard(user_id):
   return keyboard
 
 
-def get_done_promo_keyboard():
+# Клавиатура для режима акции
+def get_promo_keyboard():
   keyboard = ReplyKeyboardMarkup(
       keyboard=[
-          [KeyboardButton(text="✅ Готово, застосувати знижку")]
+          [KeyboardButton(text="✅ Готово, застосувати знижку")],
+          [KeyboardButton(text="🔙 Повернутися в головне меню")],
+      ],
+      resize_keyboard=True,
+  )
+  return keyboard
+
+
+# Клавиатура для отмены
+def get_cancel_keyboard():
+  keyboard = ReplyKeyboardMarkup(
+      keyboard=[
+          [KeyboardButton(text="🔙 Повернутися в головне меню")]
       ],
       resize_keyboard=True,
   )
@@ -237,7 +250,22 @@ async def cmd_start(message: Message, state: FSMContext):
   )
 
 
-# --- 1. РЕЖИМ АКЦИИ (ПЕРЕСЫЛКА ФОТО НА ЛЕТУ) ---
+# --- КНОПКА ВОЗВРАТА В ГЛАВНОЕ МЕНЮ ---
+@dp.message(F.text == "🔙 Повернутися в головне меню")
+async def cancel_to_main_menu(message: Message, state: FSMContext):
+  await state.clear()
+  user_id = message.from_user.id
+  
+  if hasattr(message.bot, "promo_batch") and user_id in message.bot.promo_batch:
+    message.bot.promo_batch[user_id] = []
+
+  await message.answer(
+      "🏠 Ви повернулися до головного меню.",
+      reply_markup=get_main_keyboard(user_id),
+  )
+
+
+# --- 1. РЕЖИМ АКЦИИ ---
 @dp.message(AdminStates.waiting_for_promo_photos, F.photo)
 async def collect_promo_photos(message: Message, state: FSMContext):
   user_id = message.from_user.id
@@ -251,10 +279,10 @@ async def collect_promo_photos(message: Message, state: FSMContext):
       "caption": message.caption or ""
   })
   count = len(message.bot.promo_batch[user_id])
-  await message.answer(f"✅ Додано товар для акції №{count}. Надсилайте ще або натисніть «Готово».")
+  await message.answer(f"✅ Додано товар для акції №{count}. Надсилайте ще або натисніть «Готово».", reply_markup=get_promo_keyboard())
 
 
-# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В ПЕРСОНАЛЬНУЮ БАЗУ ---
+# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В БАЗУ ---
 @dp.message(F.photo)
 async def auto_collect_posts(message: Message, state: FSMContext):
   current_state = await state.get_state()
@@ -324,7 +352,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
         f"📥 У вашій базі даних збережено виробів: **{total_saved} шт.**\n\n"
         "Надішліть файл Excel (`.xlsx`) або скопіюйте текст із таблиці ціноутворення 1С.\n"
         "*(Після оновлення все, чого немає в цій таблиці, автоматично видалиться як продане)*",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=get_cancel_keyboard(),
     )
 
   elif text == "🔥 Акція":
@@ -337,7 +365,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
         f"🔥 **Режим акції (поточна знижка: {settings['discount']}%)**\n\n"
         "Перешліть сюди товари, для яких робите акцію (ніяких кодів не потрібно!). "
         "Коли перешліть усі, натисніть кнопку нижче ⬇️",
-        reply_markup=get_done_promo_keyboard(),
+        reply_markup=get_promo_keyboard(),
     )
 
   elif text == "📊 Статистика бази":
@@ -357,11 +385,11 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
 
   elif text == "✍️ Ввести свій текст акції":
     await state.set_state(AdminStates.waiting_for_custom_promo)
-    await message.answer("✍️ Надішліть текстом новий заголовок для вашої акції:", reply_markup=ReplyKeyboardRemove())
+    await message.answer("✍️ Надішліть текстом новий заголовок для вашої акції:", reply_markup=get_cancel_keyboard())
 
   elif text == "🔢 Ввести свій % знижки":
     await state.set_state(AdminStates.waiting_for_custom_discount)
-    await message.answer("🔢 Введіть числом бажаний відсоток знижки (наприклад: 6 або 12):", reply_markup=ReplyKeyboardRemove())
+    await message.answer("🔢 Введіть числом бажаний відсоток знижки (наприклад: 6 або 12):", reply_markup=get_cancel_keyboard())
 
   elif text == "⚙️ Поточні налаштування":
     await message.answer(
@@ -408,7 +436,7 @@ async def finish_promo_batch(message: Message, state: FSMContext):
   )
 
 
-# --- ОБРАБОТКА ТАБЛИЦЫ 1С: ОБНОВЛЕНИЕ ЦЕН И АВТОМАТИЧЕСКАЯ ОЧИСТКА ---
+# --- ОБРАБОТКА ТАБЛИЦЫ 1С: ОБНОВЛЕНИЕ ЦЕН И ОТЧЕТ О НЕНАЙДЕННЫХ КОДАХ ---
 @dp.message(AdminStates.waiting_for_group_table, F.document | F.text)
 async def process_table_and_send_posts(message: Message, state: FSMContext):
   user_id = str(message.from_user.id)
@@ -443,7 +471,7 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
         if norm_code and item_price and len(norm_code) >= 5:
           price_database[norm_code] = item_price
     except Exception as e:
-      await message.answer(f"❌ Помилка читання файлу: {e}")
+      await message.answer(f"❌ Помилка читання файлу: {e}", reply_markup=get_main_keyboard(user_id))
       return
 
   elif message.text:
@@ -463,7 +491,7 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
           continue
 
   if not price_database:
-    await message.answer("❌ Не вдалося розпізнати штрихкоди та ціни.")
+    await message.answer("❌ Не вдалося розпізнати штрихкоди та ціни.", reply_markup=get_main_keyboard(user_id))
     await state.clear()
     return
 
@@ -481,7 +509,9 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
 
   new_user_db = {}
   removed_count = 0
+  not_found_codes = []
 
+  # Проверяем, какие товары из базы есть в таблице 1С
   for code, post_info in flat_posts.items():
     if code in price_database:
       new_price = price_database[code]
@@ -502,17 +532,33 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
     else:
       removed_count += 1
 
+  # Находим коды из таблицы 1С, которых физически НЕ оказалось в базе бота
+  for code_1c in price_database.keys():
+    if code_1c not in flat_posts:
+      not_found_codes.append(code_1c)
+
   user_databases[user_id] = new_user_db
   save_json(DB_FILE, user_databases)
 
-  await state.clear()
-  await message.answer(
+  # Формируем красивый отчет
+  report_text = (
       f"✅ Готово!\n"
       f"• Надіслано оновлених постів: {sent_count}\n"
-      f"• Видалено з бази (продано / немає в 1С): {removed_count} шт.\n\n"
-      f"У вашій базі тепер актуальних товарів: **{len(new_user_db)} шт.**",
-      reply_markup=get_main_keyboard(message.from_user.id),
+      f"• Видалено з бази (продано / немає в 1С): {removed_count} шт.\n"
+      f"• У вашій базі тепер актуальних товарів: **{len(new_user_db)} шт.**"
   )
+
+  if not_found_codes:
+    # Ограничим вывод списка, если кодов слишком много, чтобы не заспамить чат
+    codes_preview = ", ".join(not_found_codes[:20])
+    extra_text = f" (і ще {len(not_found_codes) - 20} шт.)" if len(not_found_codes) > 20 else ""
+    report_text += (
+        f"\n\n⚠️ **Увага! У таблиці 1С є товари, яких немає у вашій базі ({len(not_found_codes)} шт.):**\n"
+        f"`{codes_preview}{extra_text}`"
+    )
+
+  await state.clear()
+  await message.answer(report_text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(message.from_user.id))
 
 
 @dp.message(AdminStates.waiting_for_custom_promo, F.text)
@@ -529,7 +575,7 @@ async def save_custom_discount(message: Message, state: FSMContext):
   try:
     val = float(message.text.strip().replace(",", "."))
   except ValueError:
-    await message.answer("❌ Введіть число:")
+    await message.answer("❌ Введіть число:", reply_markup=get_cancel_keyboard())
     return
   settings = get_user_settings(message.from_user.id)
   settings["discount"] = val
@@ -542,7 +588,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Чистый бот запущен...")
+  print("Бот со списком ненайденных кодов запущен...")
   await dp.start_polling(bot)
 
 
