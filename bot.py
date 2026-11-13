@@ -265,7 +265,7 @@ async def cancel_to_main_menu(message: Message, state: FSMContext):
   )
 
 
-# --- 1. РЕЖИМ АКЦИИ ---
+# --- 1. РЕЖИМ АКЦИИ (ПЕРЕСЫЛКА ФОТО НА ЛЕТУ) ---
 @dp.message(AdminStates.waiting_for_promo_photos, F.photo)
 async def collect_promo_photos(message: Message, state: FSMContext):
   user_id = message.from_user.id
@@ -282,11 +282,12 @@ async def collect_promo_photos(message: Message, state: FSMContext):
   await message.answer(f"✅ Додано товар для акції №{count}. Надсилайте ще або натисніть «Готово».", reply_markup=get_promo_keyboard())
 
 
-# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В БАЗУ ---
+# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В БАЗУ (БЛОКИРУЕТСЯ В РЕЖИМЕ АКЦИИ) ---
 @dp.message(F.photo)
 async def auto_collect_posts(message: Message, state: FSMContext):
   current_state = await state.get_state()
-  if current_state == AdminStates.waiting_for_group_table.state:
+  # Если мы ждем таблицу 1С или находимся в режиме акции — обычный сбор не срабатывает вообще!
+  if current_state in [AdminStates.waiting_for_group_table.state, AdminStates.waiting_for_promo_photos.state]:
     return
 
   user_id = str(message.from_user.id)
@@ -511,7 +512,6 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
   removed_count = 0
   not_found_codes = []
 
-  # Проверяем, какие товары из базы есть в таблице 1С
   for code, post_info in flat_posts.items():
     if code in price_database:
       new_price = price_database[code]
@@ -532,7 +532,6 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
     else:
       removed_count += 1
 
-  # Находим коды из таблицы 1С, которых физически НЕ оказалось в базе бота
   for code_1c in price_database.keys():
     if code_1c not in flat_posts:
       not_found_codes.append(code_1c)
@@ -540,7 +539,6 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
   user_databases[user_id] = new_user_db
   save_json(DB_FILE, user_databases)
 
-  # Формируем красивый отчет
   report_text = (
       f"✅ Готово!\n"
       f"• Надіслано оновлених постів: {sent_count}\n"
@@ -549,7 +547,6 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
   )
 
   if not_found_codes:
-    # Ограничим вывод списка, если кодов слишком много, чтобы не заспамить чат
     codes_preview = ", ".join(not_found_codes[:20])
     extra_text = f" (і ще {len(not_found_codes) - 20} шт.)" if len(not_found_codes) > 20 else ""
     report_text += (
@@ -588,7 +585,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот со списком ненайденных кодов запущен...")
+  print("Бот с отключением автосбора в режиме акции запущен...")
   await dp.start_polling(bot)
 
 
