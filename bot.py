@@ -61,20 +61,16 @@ def get_user_settings(user_id):
   return users_settings[uid_str]
 
 
-# Универсальная функция подсчета точного количества товаров у пользователя
 def get_user_total_count(user_id):
   uid_str = str(user_id)
   user_db = user_databases.get(uid_str, {})
   if not isinstance(user_db, dict):
     return 0
-  # Если база старого формата (содержит chat_id), конвертируем «на лету» или считаем суммарно
   total = 0
   for key, val in user_db.items():
     if isinstance(val, dict) and "photo" in val:
-      # Это уже плоский формат товара
       total += 1
     elif isinstance(val, dict):
-      # Это старый формат с chat_id
       total += len(val)
   return total
 
@@ -258,7 +254,7 @@ async def collect_promo_photos(message: Message, state: FSMContext):
   await message.answer(f"✅ Додано товар для акції №{count}. Надсилайте ще або натисніть «Готово».")
 
 
-# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В ПЕРСОНАЛЬНУЮ ПУЛ-БАЗУ ---
+# --- 2. ОБЫЧНЫЙ ФОНОВЫЙ СБОР В ПЕРСОНАЛЬНУЮ БАЗУ ---
 @dp.message(F.photo)
 async def auto_collect_posts(message: Message, state: FSMContext):
   current_state = await state.get_state()
@@ -273,7 +269,6 @@ async def auto_collect_posts(message: Message, state: FSMContext):
     if user_id not in user_databases:
       user_databases[user_id] = {}
     
-    # Поддерживаем миграцию со старого формата на плоский
     if any(isinstance(v, dict) and not "photo" in v for v in user_databases[user_id].values()):
       flat_dict = {}
       for k, v in user_databases[user_id].items():
@@ -477,7 +472,6 @@ async def process_table_and_send_posts(message: Message, state: FSMContext):
   sent_count = 0
   user_db = user_databases.get(user_id, {})
   
-  # Приводим к единому плоскому словарю для корректной фильтрации
   flat_posts = {}
   for k, v in user_db.items():
     if isinstance(v, dict) and "photo" in v:
@@ -548,7 +542,7 @@ async def main():
   threading.Thread(target=run_dummy_web_server, daemon=True).start()
   await bot.delete_webhook(drop_pending_updates=True)
   logging.basicConfig(level=logging.INFO)
-  print("Бот с точным подсчетом статистики запущен...")
+  print("Чистый бот запущен...")
   await dp.start_polling(bot)
 
 
