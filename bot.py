@@ -7,12 +7,13 @@ import logging
 import math
 import os
 import re
-import shutil
+import sqlite3
 import threading
+import time
 
 import openpyxl
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties  # aiogram >= 3.7
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command
@@ -29,12 +30,14 @@ if not TOKEN:
 
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
-DB_FILE = os.path.join(DATA_DIR, "group_posts_db.json")
-SETTINGS_FILE = os.path.join(DATA_DIR, "user_settings.json")
+DB_PATH = os.path.join(DATA_DIR, "bot.db")
 
-MIN_CODE_LEN = 5          
-CAPTION_LIMIT = 1024      
-SUMMARY_DELAY = 1.5       
+MIN_CODE_LEN = 5
+CAPTION_LIMIT = 1024
+SUMMARY_DELAY = 1.5
+
+DEFAULT_PROMO = "АКЦІЙНА ПРОПОЗИЦІЯ"
+DEFAULT_DISCOUNT = 6.0
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -45,8 +48,107 @@ def esc(text) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Хранилище (JSON, атомарная запись)
+# Хранилище (SQLite, WAL)
 # ---------------------------------------------------------------------------
+class Database:
+    def __init__(self, path: str):
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        with self.lock, self.conn:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.executescript("""
+                CREATE TABLE IF NOT EXISTS posts (
+                    user_id   INTEGER NOT NULL,
+                    code      TEXT    NOT NULL,
+                    photo     TEXT    NOT NULL,
+                    caption   TEXT    NOT NULL DEFAULT '',
+                    updated_at REAL   NOT NULL,
+                    PRIMARY KEY (user_id, code)
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    user_id INTEGER PRIMARY KEY,
+                    promo   TEXT    NOT NULL,
+                    discount REAL   NOT NULL
+                );
+            """)
+
+    # -- посты --
+    def upsert_post(self, user_id: int, code: str, photo: str, caption: str) -> bool:
+        """Возвращает True, если пост уже существовал (обновление)."""
+        with self.lock, self.conn:
+            row = self.conn.execute(
+                "SELECT 1 FROM posts WHERE user_id=? AND code=?", (user_id, code)
+            ).fetchone()
+            self.conn.execute(
+                "INSERT INTO posts(user_id, code, photo, caption, updated_at) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(user_id, code) DO UPDATE SET "
+                "photo=excluded.photo, caption=excluded.caption, updated_at=excluded.updated_at",
+                (user_id, code, photo, caption, time.time()),
+            )
+        return row is not None
+
+    def count_posts(self, user_id: int) -> int:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM posts WHERE user_id=?", (user_id,)
+            ).fetchone()
+        return int(row["c"])
+
+    def get_posts(self, user_id: int) -> dict:
+        """dict: code -> {"photo": ..., "caption": ...}"""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT code, photo, caption FROM posts WHERE user_id=?", (user_id,)
+            ).fetchall()
+        return {r["code"]: {"photo": r["photo"], "caption": r["caption"]} for r in rows}
+
+    def replace_posts(self, user_id: int, posts: dict):
+        """Полная замена набора постов пользователя (для синхронизации)."""
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM posts WHERE user_id=?", (user_id,))
+            self.conn.executemany(
+                "INSERT INTO posts(user_id, code, photo, caption, updated_at) VALUES(?,?,?,?,?)",
+                [
+                    (user_id, code, post["photo"], post.get("caption", ""), time.time())
+                    for code, post in posts.items()
+                ],
+            )
+
+    def clear_posts(self, user_id: int):
+        with self.lock, self.conn:
+            self.conn.execute("DELETE FROM posts WHERE user_id=?", (user_id,))
+
+    # -- настройки --
+    def get_settings(self, user_id: int):
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT promo, discount FROM settings WHERE user_id=?", (user_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {"promo": row["promo"], "discount": float(row["discount"])}
+
+    def set_settings(self, user_id: int, promo: str, discount: float):
+        with self.lock, self.conn:
+            self.conn.execute(
+                "INSERT INTO settings(user_id, promo, discount) VALUES(?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET promo=excluded.promo, discount=excluded.discount",
+                (user_id, promo, discount),
+            )
+
+    def backup(self, dest_path: str):
+        """Консистентная копия через SQLite backup API."""
+        with self.lock:
+            dst = sqlite3.connect(dest_path)
+            try:
+                self.conn.backup(dst)
+            finally:
+                dst.close()
+
+
 def load_json(filename, default_val):
     if os.path.exists(filename):
         try:
@@ -55,16 +157,6 @@ def load_json(filename, default_val):
         except Exception as e:
             logging.error(f"Ошибка чтения {filename}: {e}")
     return default_val
-
-
-def save_json(filename, data):
-    tmp = filename + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, filename)
-    except Exception as e:
-        logging.error(f"Ошибка сохранения {filename}: {e}")
 
 
 def flatten_db(user_db) -> dict:
@@ -79,26 +171,60 @@ def flatten_db(user_db) -> dict:
     return flat
 
 
-user_databases = load_json(DB_FILE, {})
-users_settings = load_json(SETTINGS_FILE, {})
+def migrate_from_json(db: Database):
+    """Одноразовый перенос старых JSON-файлов в SQLite."""
+    legacy_db = os.path.join(DATA_DIR, "group_posts_db.json")
+    if os.path.exists(legacy_db):
+        raw = load_json(legacy_db, {})
+        users = raw.get("users", raw) if isinstance(raw, dict) else {}
+        total = 0
+        for uid, posts in users.items():
+            try:
+                uid_int = int(uid)
+            except (TypeError, ValueError):
+                continue
+            flat = flatten_db(posts)
+            if flat:
+                db.replace_posts(uid_int, flat)
+                total += len(flat)
+        os.replace(legacy_db, legacy_db + ".imported")
+        logging.info(f"Перенесено {total} постов из group_posts_db.json в SQLite")
 
-for _uid in list(user_databases.keys()):
-    user_databases[_uid] = flatten_db(user_databases[_uid])
-save_json(DB_FILE, user_databases)
+    legacy_settings = os.path.join(DATA_DIR, "user_settings.json")
+    if os.path.exists(legacy_settings):
+        users_settings = load_json(legacy_settings, {})
+        for uid, s in users_settings.items():
+            if not isinstance(s, dict):
+                continue
+            try:
+                uid_int = int(uid)
+            except (TypeError, ValueError):
+                continue
+            db.set_settings(
+                uid_int,
+                str(s.get("promo", DEFAULT_PROMO)),
+                float(s.get("discount", DEFAULT_DISCOUNT)),
+            )
+        os.replace(legacy_settings, legacy_settings + ".imported")
+        logging.info("Перенесены настройки из user_settings.json в SQLite")
+
+
+db = Database(DB_PATH)
+migrate_from_json(db)
 
 promo_batches: dict[int, list] = {}
 
 
-def get_user_settings(user_id):
-    uid = str(user_id)
-    if uid not in users_settings:
-        users_settings[uid] = {"promo": "АКЦІЙНА ПРОПОЗИЦІЯ", "discount": 6.0}
-        save_json(SETTINGS_FILE, users_settings)
-    return users_settings[uid]
+def get_user_settings(user_id: int) -> dict:
+    s = db.get_settings(user_id)
+    if s is None:
+        s = {"promo": DEFAULT_PROMO, "discount": DEFAULT_DISCOUNT}
+        db.set_settings(user_id, s["promo"], s["discount"])
+    return s
 
 
-def get_user_total_count(user_id) -> int:
-    return len(user_databases.get(str(user_id), {}))
+def get_user_total_count(user_id: int) -> int:
+    return db.count_posts(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +258,10 @@ def run_dummy_web_server():
 class AdminStates(StatesGroup):
     waiting_for_custom_promo = State()
     waiting_for_custom_discount = State()
-    waiting_for_group_table = State()      
-    waiting_for_sync_confirm = State()     
-    waiting_for_promo_photos = State()     
-    waiting_for_clear_confirm = State()    
+    waiting_for_group_table = State()
+    waiting_for_sync_confirm = State()
+    waiting_for_promo_photos = State()
+    waiting_for_clear_confirm = State()
 
 
 BTN_SYNC = "🔄 Отримати оновлені пости за таблицею"
@@ -152,11 +278,14 @@ BTN_CLEAR_CONFIRM = "✅ Так, очистити базу"
 
 MENU_TEXTS = {BTN_SYNC, BTN_PROMO, BTN_PROMO_TEXT, BTN_DISCOUNT, BTN_SETTINGS, BTN_STATS, BTN_CLEAR, BTN_BACK}
 
+# Защита: в этих состояниях фоновый сбор фото заблокирован
 NO_AUTOCOLLECT_STATES = {
     AdminStates.waiting_for_group_table.state,
     AdminStates.waiting_for_sync_confirm.state,
     AdminStates.waiting_for_promo_photos.state,
     AdminStates.waiting_for_clear_confirm.state,
+    AdminStates.waiting_for_custom_promo.state,
+    AdminStates.waiting_for_custom_discount.state,
 }
 
 
@@ -271,7 +400,15 @@ def fmt_price(value: float) -> str:
 
 
 def parse_price_number(raw: str) -> float:
-    return float(raw.replace("\u00a0", "").replace(" ", "").replace(",", "."))
+    cleaned = raw.replace("\u00a0", "").replace(" ", "")
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    else:
+        cleaned = cleaned.replace(",", ".")
+    return float(cleaned)
 
 
 def update_price_and_clean_caption(caption: str, new_price: float) -> str:
@@ -292,7 +429,6 @@ def update_price_and_clean_caption(caption: str, new_price: float) -> str:
 
 def apply_promo_logic(caption: str, promo_header: str, discount_percent: float) -> str:
     raw_caption = caption or ""
-    # Защита от повторного применения акции
     if "🔥 Акційна ціна" in raw_caption or "<s>" in raw_caption:
         return remove_code_line(esc(raw_caption))
 
@@ -349,12 +485,15 @@ async def send_post(chat_id: int, photo: str, caption: str) -> bool:
 def as_digits(cell):
     if isinstance(cell, bool) or cell is None:
         return None
-    if isinstance(cell, float):
-        if not cell.is_integer():
-            return None
-        return str(int(cell))
     if isinstance(cell, int):
         return str(cell)
+    if isinstance(cell, float):
+        # ВАЖНО: float даёт ~15-16 значащих цифр — для длинных штрихкодов
+        # используем repr-округление только если значение целочисленно без потерь.
+        s = repr(cell)
+        if re.fullmatch(r"\d+[eE]\+?\d+", s) or re.fullmatch(r"\d+\.0", s):
+            return str(int(cell))
+        return None
     s = str(cell).strip()
     if re.fullmatch(r"\d+(?:\.\d+)?[eE]\+?\d+", s):
         try:
@@ -372,9 +511,8 @@ def to_number(cell):
     if isinstance(cell, (int, float)):
         n = float(cell)
     else:
-        s = str(cell).replace("\u00a0", "").replace(" ", "").replace(",", ".")
         try:
-            n = float(s)
+            n = parse_price_number(str(cell))
         except ValueError:
             return None
     return n if math.isfinite(n) else None
@@ -393,7 +531,7 @@ def parse_row(cells):
         return None
     for c in reversed(cells[code_idx + 1:]):
         n = to_number(c)
-        if n is not None and n > 10:
+        if n is not None and n > 0:
             return code, n
     return None
 
@@ -480,15 +618,11 @@ async def auto_collect_posts(message: Message, state: FSMContext):
         return
 
     uid_int = message.from_user.id
-    uid = str(uid_int)
     caption = message.caption or ""
     code = extract_code_from_text(caption)
 
     if code:
-        db = user_databases.setdefault(uid, {})
-        is_update = code in db
-        db[code] = {"photo": message.photo[-1].file_id, "caption": caption}
-        save_json(DB_FILE, user_databases)
+        is_update = db.upsert_post(uid_int, code, message.photo[-1].file_id, caption)
         inc = {"updated": 1} if is_update else {"added": 1}
     else:
         inc = {"nocode": 1}
@@ -510,7 +644,6 @@ async def auto_collect_posts(message: Message, state: FSMContext):
 @dp.message(F.text.in_(MENU_TEXTS))
 async def handle_menu_buttons(message: Message, state: FSMContext):
     uid_int = message.from_user.id
-    uid = str(uid_int)
     text = message.text
     await state.clear()
     drop_pending(uid_int)
@@ -585,11 +718,9 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_for_clear_confirm, F.text == BTN_CLEAR_CONFIRM)
 async def confirm_clear(message: Message, state: FSMContext):
-    uid = str(message.from_user.id)
-    if os.path.exists(DB_FILE):
-        shutil.copy2(DB_FILE, DB_FILE + ".bak")
-    user_databases[uid] = {}
-    save_json(DB_FILE, user_databases)
+    uid = message.from_user.id
+    db.backup(DB_PATH + ".bak")
+    db.clear_posts(uid)
     await state.clear()
     await message.answer("🗑 Ваша база даних повністю очищена.", reply_markup=get_main_keyboard())
 
@@ -631,7 +762,7 @@ async def finish_promo_batch(message: Message, state: FSMContext):
     F.document | (F.text & ~F.text.in_(MENU_TEXTS))
 )
 async def process_table(message: Message, state: FSMContext):
-    uid = str(message.from_user.id)
+    uid = message.from_user.id
     price_database = {}
 
     if message.document:
@@ -662,7 +793,7 @@ async def process_table(message: Message, state: FSMContext):
         )
         return
 
-    flat_posts = user_databases.get(uid, {})
+    flat_posts = db.get_posts(uid)
     matched = [c for c in flat_posts if c in price_database]
     to_remove = len(flat_posts) - len(matched)
     not_found = [c for c in price_database if c not in flat_posts]
@@ -692,7 +823,6 @@ async def process_table(message: Message, state: FSMContext):
 @dp.message(AdminStates.waiting_for_sync_confirm, F.text == BTN_SYNC_CONFIRM)
 async def confirm_sync(message: Message, state: FSMContext):
     uid_int = message.from_user.id
-    uid = str(uid_int)
     data = await state.get_data()
     price_database = data.get("prices") or {}
     await state.clear()
@@ -703,7 +833,7 @@ async def confirm_sync(message: Message, state: FSMContext):
 
     await message.answer("🔄 Оновлюю ціни та синхронізую базу з 1С...")
 
-    flat_posts = user_databases.get(uid, {})
+    flat_posts = db.get_posts(uid_int)
     new_user_db = {}
     removed = 0
     sent, failed = 0, 0
@@ -722,10 +852,8 @@ async def confirm_sync(message: Message, state: FSMContext):
 
     not_found = [c for c in price_database if c not in flat_posts]
 
-    if os.path.exists(DB_FILE):
-        shutil.copy2(DB_FILE, DB_FILE + ".bak")
-    user_databases[uid] = new_user_db
-    save_json(DB_FILE, user_databases)
+    db.backup(DB_PATH + ".bak")
+    db.replace_posts(uid_int, new_user_db)
 
     report = (
         f"✅ Готово!\n"
@@ -755,9 +883,8 @@ async def sync_confirm_reminder(message: Message):
 
 @dp.message(AdminStates.waiting_for_custom_promo, F.text)
 async def save_custom_promo(message: Message, state: FSMContext):
-    settings = get_user_settings(message.from_user.id)
-    settings["promo"] = message.text.strip()
-    save_json(SETTINGS_FILE, users_settings)
+    s = get_user_settings(message.from_user.id)
+    db.set_settings(message.from_user.id, message.text.strip(), s["discount"])
     await state.clear()
     await message.answer("✅ Текст акції змінено для вашого аккаунта!", reply_markup=get_main_keyboard())
 
@@ -772,9 +899,8 @@ async def save_custom_discount(message: Message, state: FSMContext):
     if not (0 < val < 100):
         await message.answer("❌ Відсоток має бути більшим за 0 і меншим за 100:", reply_markup=get_cancel_keyboard())
         return
-    settings = get_user_settings(message.from_user.id)
-    settings["discount"] = val
-    save_json(SETTINGS_FILE, users_settings)
+    s = get_user_settings(message.from_user.id)
+    db.set_settings(message.from_user.id, s["promo"], val)
     await state.clear()
     await message.answer(f"✅ Знижку змінено на: {val:g}% для вашого аккаунта!", reply_markup=get_main_keyboard())
 
