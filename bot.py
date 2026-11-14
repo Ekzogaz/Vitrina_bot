@@ -287,7 +287,6 @@ BTN_EDIT_CANCEL = "❌ Скасувати редагування"
 
 MENU_TEXTS = {BTN_SYNC, BTN_PROMO, BTN_PROMO_TEXT, BTN_DISCOUNT, BTN_SETTINGS, BTN_STATS, BTN_CLEAR, BTN_BACK}
 
-# Защита: в этих состояниях фоновый сбор фото заблокирован
 NO_AUTOCOLLECT_STATES = {
     AdminStates.waiting_for_group_table.state,
     AdminStates.waiting_for_sync_confirm.state,
@@ -606,4 +605,408 @@ def parse_text_table(text: str) -> dict:
 # Хэндлеры
 # ---------------------------------------------------------------------------
 @dp.message(Command("start"))
-async def cmd_start(me
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    uid = message.from_user.id
+    drop_pending(uid)
+    promo_batches.pop(uid, None)
+    s = get_user_settings(uid)
+    await message.answer(
+        "Привіт! 👋 Я ваш персональний помічник для роботи з каталогом.\n\n"
+        f"📋 Ваші поточні налаштування:\n"
+        f"• Акція: {esc(s['promo'])}\n"
+        f"• Знижка: {s['discount']:g}%\n\n"
+        "• Пересилайте звичайні пости сюди — база захищена від дублікатів.\n"
+        "• Натискайте «🔥 Акція», щоб переслати товари і на лету отримати розрахунок знижки!\n"
+        "• Під кожним відправленим постом є кнопка «✏️ Редагувати».",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@dp.message(F.text.in_({BTN_BACK, BTN_EDIT_CANCEL}))
+async def cancel_to_main_menu(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    await state.clear()
+    drop_pending(uid)
+    promo_batches.pop(uid, None)
+    await message.answer("🏠 Ви повернулися до головного меню.", reply_markup=get_main_keyboard())
+
+
+@dp.message(AdminStates.waiting_for_promo_photos, F.photo)
+async def collect_promo_photos(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    batch = promo_batches.setdefault(uid, [])
+    batch.append({"photo": message.photo[-1].file_id, "caption": message.caption or ""})
+
+    async def send(stats):
+        count = len(promo_batches.get(uid, []))
+        await message.answer(
+            f"✅ Додано товарів для акції: <b>{count}</b>. Надсилайте ще або натисніть «Готово».",
+            reply_markup=get_promo_keyboard(),
+        )
+
+    schedule_summary(uid, send)
+
+
+@dp.message(F.photo)
+async def auto_collect_posts(message: Message, state: FSMContext):
+    if await state.get_state() in NO_AUTOCOLLECT_STATES:
+        return
+
+    uid_int = message.from_user.id
+    caption = message.caption or ""
+    code = extract_code_from_text(caption)
+
+    if code:
+        is_update = db.upsert_post(uid_int, code, message.photo[-1].file_id, caption)
+        inc = {"updated": 1} if is_update else {"added": 1}
+    else:
+        inc = {"nocode": 1}
+
+    async def send(stats):
+        lines = []
+        if stats.get("added"):
+            lines.append(f"✅ Додано нових товарів: <b>{stats['added']}</b>")
+        if stats.get("updated"):
+            lines.append(f"🔄 Оновлено (вже були в базі): <b>{stats['updated']}</b>")
+        if stats.get("nocode"):
+            lines.append(f"ℹ️ Без коду в тексті (не додано): <b>{stats['nocode']}</b>")
+        lines.append(f"📦 Всього у базі: <b>{get_user_total_count(uid_int)} шт.</b>")
+        await message.answer("\n".join(lines), reply_markup=get_main_keyboard())
+
+    schedule_summary(uid_int, send, **inc)
+
+
+@dp.message(F.text.in_(MENU_TEXTS))
+async def handle_menu_buttons(message: Message, state: FSMContext):
+    uid_int = message.from_user.id
+    text = message.text
+    await state.clear()
+    drop_pending(uid_int)
+    promo_batches.pop(uid_int, None)
+
+    settings = get_user_settings(uid_int)
+    total = get_user_total_count(uid_int)
+
+    if text == BTN_SYNC:
+        if total == 0:
+            await message.answer(
+                "⚠️ Ваша база даних порожня! Перешліть пости з групи сюди.",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        await state.set_state(AdminStates.waiting_for_group_table)
+        await message.answer(
+            f"📥 У вашій базі даних збережено виробів: <b>{total} шт.</b>\n\n"
+            "Надішліть файл Excel (<code>.xlsx</code>) або скопіюйте текст із таблиці ціноутворення 1С.\n"
+            "<i>(Після підтвердження все, чого немає в цій таблиці, буде видалено як продане)</i>",
+            reply_markup=get_cancel_keyboard(),
+        )
+
+    elif text == BTN_PROMO:
+        promo_batches[uid_int] = []
+        await state.set_state(AdminStates.waiting_for_promo_photos)
+        await message.answer(
+            f"🔥 <b>Режим акції (поточна знижка: {settings['discount']:g}%)</b>\n\n"
+            "Перешліть сюди товари, для яких робите акцію (ніяких кодів не потрібно!). "
+            "Коли перешліть усі, натисніть кнопку нижче ⬇️",
+            reply_markup=get_promo_keyboard(),
+        )
+
+    elif text == BTN_STATS:
+        await message.answer(
+            f"📊 Статистика:\n"
+            f"• Загалом збережених товарів у вашій базі: <b>{total} шт.</b>\n"
+            f"• Ваша поточна акція: {esc(settings['promo'])}\n"
+            f"• Ваша поточна знижка: {settings['discount']:g}%",
+            reply_markup=get_main_keyboard(),
+        )
+
+    elif text == BTN_CLEAR:
+        await state.set_state(AdminStates.waiting_for_clear_confirm)
+        await message.answer(
+            f"⚠️ Ви впевнені? Буде видалено всі товари з бази (<b>{total} шт.</b>).",
+            reply_markup=get_confirm_keyboard(BTN_CLEAR_CONFIRM),
+        )
+
+    elif text == BTN_PROMO_TEXT:
+        await state.set_state(AdminStates.waiting_for_custom_promo)
+        await message.answer(
+            "✍️ Надішліть текстом новий заголовок для вашої акції:",
+            reply_markup=get_cancel_keyboard(),
+        )
+
+    elif text == BTN_DISCOUNT:
+        await state.set_state(AdminStates.waiting_for_custom_discount)
+        await message.answer(
+            "🔢 Введіть числом бажаний відсоток знижки (наприклад: 6 або 12):",
+            reply_markup=get_cancel_keyboard(),
+        )
+
+    elif text == BTN_SETTINGS:
+        await message.answer(
+            f"📋 Ваші поточні налаштування:\n"
+            f"• Акція: {esc(settings['promo'])}\n"
+            f"• Знижка: {settings['discount']:g}%",
+            reply_markup=get_main_keyboard(),
+        )
+
+
+@dp.message(AdminStates.waiting_for_clear_confirm, F.text == BTN_CLEAR_CONFIRM)
+async def confirm_clear(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    db.backup(DB_PATH + ".bak")
+    db.clear_posts(uid)
+    await state.clear()
+    await message.answer("🗑 Ваша база даних повністю очищена.", reply_markup=get_main_keyboard())
+
+
+@dp.message(AdminStates.waiting_for_promo_photos, F.text == BTN_PROMO_DONE)
+async def finish_promo_batch(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    drop_pending(uid)
+    batch = promo_batches.pop(uid, [])
+    await state.clear()
+
+    if not batch:
+        await message.answer("❌ Ви не надіслали жодного товару для акції!", reply_markup=get_main_keyboard())
+        return
+
+    settings = get_user_settings(uid)
+    await message.answer(f"🔄 Формую акційні пости (знижка -{settings['discount']:g}%)...")
+
+    sent, failed = 0, 0
+    for item in batch:
+        caption = apply_promo_logic(item["caption"], settings["promo"], settings["discount"])
+        msg_id = await send_post(uid, item["photo"], caption)
+        if msg_id is not None:
+            sent += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.3)
+
+    report = (
+        f"✅ Готово! Надіслано акційних постів: <b>{sent}</b>\n"
+        "Усі ціни зі знижкою, штрихкоди приховані — можете пересилати у групу!\n"
+        "Під кожним постом є кнопка «✏️ Редагувати»."
+    )
+    if failed:
+        report += f"\n⚠️ Не вдалося надіслати: <b>{failed}</b> (деталі в логах)"
+    await message.answer(report, reply_markup=get_main_keyboard())
+
+
+@dp.callback_query(F.data == "edit_caption")
+async def on_edit_caption(callback: CallbackQuery, state: FSMContext):
+    msg = callback.message
+    if msg is None or msg.caption is None:
+        await callback.answer("Це повідомлення не можна редагувати.", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_edit_caption)
+    await state.update_data(
+        edit_chat_id=msg.chat.id,
+        edit_message_id=msg.message_id,
+        edit_old_caption=msg.caption,
+    )
+    await callback.answer()
+    await callback.message.answer(
+        "✏️ Надішліть новий текст для цього поста.\n"
+        "Можна використовувати HTML-теги: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;s&gt;</code>.\n\n"
+        "Або натисніть кнопку нижче, щоб скасувати.",
+        reply_markup=get_edit_cancel_keyboard(),
+    )
+
+
+@dp.message(AdminStates.waiting_for_edit_caption, F.text)
+async def save_edited_caption(message: Message, state: FSMContext):
+    data = await state.get_data()
+    chat_id = data.get("edit_chat_id")
+    message_id = data.get("edit_message_id")
+    new_caption = message.text.strip()
+    await state.clear()
+
+    if not chat_id or not message_id:
+        await message.answer("❌ Помилка сесії редагування. Спробуйте ще раз.", reply_markup=get_main_keyboard())
+        return
+
+    try:
+        await bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=message_id,
+            caption=new_caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_edit_inline_keyboard(),
+        )
+        await message.answer("✅ Підпис до поста успішно оновлено!", reply_markup=get_main_keyboard())
+    except TelegramAPIError as e:
+        logging.error(f"Помилка редагування caption: {e}")
+        await message.answer(
+            f"❌ Не вдалося оновити пост у Telegram: {esc(e)}\n"
+            "Можливо, текст занадто довгий або містить невалідні HTML-теги.",
+            reply_markup=get_main_keyboard(),
+        )
+
+
+@dp.message(
+    AdminStates.waiting_for_group_table,
+    F.document | (F.text & ~F.text.in_(MENU_TEXTS))
+)
+async def process_table(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    price_database = {}
+
+    if message.document:
+        name = (message.document.file_name or "").lower()
+        if not name.endswith(".xlsx"):
+            await message.answer(
+                "❌ Підтримується лише формат <code>.xlsx</code> (або надішліть текст таблиці).",
+                reply_markup=get_cancel_keyboard(),
+            )
+            return
+        try:
+            file_info = await bot.get_file(message.document.file_id)
+            buf = await bot.download_file(file_info.file_path)
+            price_database = await asyncio.to_thread(parse_excel, buf.read())
+        except Exception as e:
+            await message.answer(
+                f"❌ Помилка читання файлу: {esc(e)}",
+                reply_markup=get_cancel_keyboard(),
+            )
+            return
+    elif message.text:
+        price_database = parse_text_table(message.text)
+
+    if not price_database:
+        await message.answer(
+            "❌ Не вдалося розпізнати штрихкоди та ціни. Перевірте таблицю й спробуйте ще раз.",
+            reply_markup=get_cancel_keyboard(),
+        )
+        return
+
+    flat_posts = db.get_posts(uid)
+    matched = [c for c in flat_posts if c in price_database]
+    to_remove = len(flat_posts) - len(matched)
+    not_found = [c for c in price_database if c not in flat_posts]
+
+    if not matched:
+        await state.clear()
+        await message.answer(
+            f"❌ Жоден товар із бази не знайдено в таблиці (розпізнано позицій: {len(price_database)}).\n"
+            "Базу не змінено. Перевірте, що в таблиці саме штрихкоди.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    await state.update_data(prices=price_database)
+    await state.set_state(AdminStates.waiting_for_sync_confirm)
+    await message.answer(
+        f"🔎 Розпізнано позицій у таблиці: <b>{len(price_database)}</b>\n"
+        f"• У базі: <b>{len(flat_posts)}</b>\n"
+        f"• Збігів (будуть оновлені): <b>{len(matched)}</b>\n"
+        f"• Буде видалено з бази як продані: <b>{to_remove}</b>\n"
+        f"• Є в таблиці, але немає в базі: <b>{len(not_found)}</b>\n\n"
+        "Підтвердити оновлення?",
+        reply_markup=get_confirm_keyboard(BTN_SYNC_CONFIRM),
+    )
+
+
+@dp.message(AdminStates.waiting_for_sync_confirm, F.text == BTN_SYNC_CONFIRM)
+async def confirm_sync(message: Message, state: FSMContext):
+    uid_int = message.from_user.id
+    data = await state.get_data()
+    price_database = data.get("prices") or {}
+    await state.clear()
+
+    if not price_database:
+        await message.answer("❌ Дані таблиці втрачено. Почніть спочатку.", reply_markup=get_main_keyboard())
+        return
+
+    await message.answer("🔄 Оновлюю ціни та синхронізую базу з 1С...")
+
+    flat_posts = db.get_posts(uid_int)
+    new_user_db = {}
+    removed = 0
+    sent, failed = 0, 0
+
+    for code, post in flat_posts.items():
+        if code in price_database:
+            new_user_db[code] = post
+            caption = update_price_and_clean_caption(post["caption"], price_database[code])
+            msg_id = await send_post(uid_int, post["photo"], caption)
+            if msg_id is not None:
+                sent += 1
+            else:
+                failed += 1
+            await asyncio.sleep(0.3)
+        else:
+            removed += 1
+
+    not_found = [c for c in price_database if c not in flat_posts]
+
+    db.backup(DB_PATH + ".bak")
+    db.replace_posts(uid_int, new_user_db)
+
+    report = (
+        f"✅ Готово!\n"
+        f"• Надіслано оновлених постів: <b>{sent}</b>\n"
+        f"• Видалено з бази (продано / немає в 1С): <b>{removed} шт.</b>\n"
+        f"• У вашій базі тепер актуальних товарів: <b>{len(new_user_db)} шт.</b>"
+    )
+    if failed:
+        report += f"\n• ⚠️ Не вдалося надіслати: <b>{failed}</b> (деталі в логах)"
+    if not_found:
+        preview = ", ".join(not_found[:20])
+        extra = f" (і ще {len(not_found) - 20} шт.)" if len(not_found) > 20 else ""
+        report += (
+            f"\n\n⚠️ <b>У таблиці 1С є товари, яких немає у вашій базі ({len(not_found)} шт.):</b>\n"
+            f"<code>{preview}{extra}</code>"
+        )
+    await message.answer(report, reply_markup=get_main_keyboard())
+
+
+@dp.message(AdminStates.waiting_for_sync_confirm)
+async def sync_confirm_reminder(message: Message):
+    await message.answer(
+        "Натисніть «✅ Так, оновити базу» або поверніться в головне меню.",
+        reply_markup=get_confirm_keyboard(BTN_SYNC_CONFIRM),
+    )
+
+
+@dp.message(AdminStates.waiting_for_custom_promo, F.text)
+async def save_custom_promo(message: Message, state: FSMContext):
+    s = get_user_settings(message.from_user.id)
+    db.set_settings(message.from_user.id, message.text.strip(), s["discount"])
+    await state.clear()
+    await message.answer("✅ Текст акції змінено для вашого аккаунта!", reply_markup=get_main_keyboard())
+
+
+@dp.message(AdminStates.waiting_for_custom_discount, F.text)
+async def save_custom_discount(message: Message, state: FSMContext):
+    try:
+        val = float(message.text.strip().replace("%", "").replace(",", "."))
+    except ValueError:
+        await message.answer("❌ Введіть число:", reply_markup=get_cancel_keyboard())
+        return
+    if not (0 < val < 100):
+        await message.answer("❌ Відсоток має бути більшим за 0 і меншим за 100:", reply_markup=get_cancel_keyboard())
+        return
+    s = get_user_settings(message.from_user.id)
+    db.set_settings(message.from_user.id, s["promo"], val)
+    await state.clear()
+    await message.answer(f"✅ Знижку змінено на: {val:g}% для вашого аккаунта!", reply_markup=get_main_keyboard())
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    if os.environ.get("PORT"):
+        threading.Thread(target=run_dummy_web_server, daemon=True).start()
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("Бот запущено...")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
