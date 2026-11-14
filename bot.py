@@ -7,11 +7,12 @@ import logging
 import math
 import os
 import re
-import sqlite3
 import threading
 import time
 
 import openpyxl
+import psycopg2
+import psycopg2.extras
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -35,9 +36,9 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не задана переменная окружения BOT_TOKEN")
 
-DATA_DIR = os.environ.get("DATA_DIR", ".")
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "bot.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise SystemExit("Не задана переменная окружения DATABASE_URL")
 
 MIN_CODE_LEN = 5
 CAPTION_LIMIT = 1024
@@ -55,170 +56,157 @@ def esc(text) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Хранилище (SQLite, WAL)
+# Хранилище (PostgreSQL / Supabase)
 # ---------------------------------------------------------------------------
 class Database:
-    def __init__(self, path: str):
-        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
+    def __init__(self, dsn: str):
+        self.dsn = dsn
         self.lock = threading.RLock()
-        with self.lock, self.conn:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            self.conn.execute("PRAGMA synchronous=NORMAL")
-            self.conn.executescript("""
-                CREATE TABLE IF NOT EXISTS posts (
-                    user_id   INTEGER NOT NULL,
-                    code      TEXT    NOT NULL,
-                    photo     TEXT    NOT NULL,
-                    caption   TEXT    NOT NULL DEFAULT '',
-                    updated_at REAL   NOT NULL,
-                    PRIMARY KEY (user_id, code)
-                );
-                CREATE TABLE IF NOT EXISTS settings (
-                    user_id INTEGER PRIMARY KEY,
-                    promo   TEXT    NOT NULL,
-                    discount REAL   NOT NULL
-                );
-            """)
+        self._init_db()
+
+    def _get_conn(self):
+        # Автоматическое переподключение и режим autocommit для простоты
+        conn = psycopg2.connect(self.dsn, cursor_factory=psycopg2.extras.DictCursor)
+        conn.autocommit = True
+        return conn
+
+    def _init_db(self):
+        with self.lock:
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS posts (
+                            user_id   BIGINT NOT NULL,
+                            code      TEXT    NOT NULL,
+                            photo     TEXT    NOT NULL,
+                            caption   TEXT    NOT NULL DEFAULT '',
+                            updated_at DOUBLE PRECISION NOT NULL,
+                            PRIMARY KEY (user_id, code)
+                        );
+                        CREATE TABLE IF NOT EXISTS settings (
+                            user_id BIGINT PRIMARY KEY,
+                            promo   TEXT    NOT NULL,
+                            discount DOUBLE PRECISION NOT NULL
+                        );
+                    """)
+            finally:
+                conn.close()
 
     # -- посты --
     def upsert_post(self, user_id: int, code: str, photo: str, caption: str) -> bool:
         """Возвращает True, если пост уже существовал (обновление)."""
-        with self.lock, self.conn:
-            row = self.conn.execute(
-                "SELECT 1 FROM posts WHERE user_id=? AND code=?", (user_id, code)
-            ).fetchone()
-            self.conn.execute(
-                "INSERT INTO posts(user_id, code, photo, caption, updated_at) "
-                "VALUES(?,?,?,?,?) "
-                "ON CONFLICT(user_id, code) DO UPDATE SET "
-                "photo=excluded.photo, caption=excluded.caption, updated_at=excluded.updated_at",
-                (user_id, code, photo, caption, time.time()),
-            )
-        return row is not None
+        with self.lock:
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM posts WHERE user_id=%s AND code=%s", (user_id, code)
+                    )
+                    exists = cur.fetchone() is not None
+
+                    cur.execute(
+                        """
+                        INSERT INTO posts(user_id, code, photo, caption, updated_at) 
+                        VALUES(%s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id, code) DO UPDATE SET 
+                        photo = EXCLUDED.photo, 
+                        caption = EXCLUDED.caption, 
+                        updated_at = EXCLUDED.updated_at
+                        """,
+                        (user_id, code, photo, caption, time.time()),
+                    )
+                return exists
+            finally:
+                conn.close()
 
     def count_posts(self, user_id: int) -> int:
         with self.lock:
-            row = self.conn.execute(
-                "SELECT COUNT(*) AS c FROM posts WHERE user_id=?", (user_id,)
-            ).fetchone()
-        return int(row["c"])
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) AS c FROM posts WHERE user_id=%s", (user_id,))
+                    row = cur.fetchone()
+                return int(row["c"]) if row else 0
+            finally:
+                conn.close()
 
     def get_posts(self, user_id: int) -> dict:
         """dict: code -> {"photo": ..., "caption": ...}"""
         with self.lock:
-            rows = self.conn.execute(
-                "SELECT code, photo, caption FROM posts WHERE user_id=?", (user_id,)
-            ).fetchall()
-        return {r["code"]: {"photo": r["photo"], "caption": r["caption"]} for r in rows}
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT code, photo, caption FROM posts WHERE user_id=%s", (user_id,))
+                    rows = cur.fetchall()
+                return {r["code"]: {"photo": r["photo"], "caption": r["caption"]} for r in rows}
+            finally:
+                conn.close()
 
     def replace_posts(self, user_id: int, posts: dict):
         """Полная замена набора постов пользователя (для синхронизации)."""
-        with self.lock, self.conn:
-            self.conn.execute("DELETE FROM posts WHERE user_id=?", (user_id,))
-            self.conn.executemany(
-                "INSERT INTO posts(user_id, code, photo, caption, updated_at) VALUES(?,?,?,?,?)",
-                [
-                    (user_id, code, post["photo"], post.get("caption", ""), time.time())
-                    for code, post in posts.items()
-                ],
-            )
+        with self.lock:
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM posts WHERE user_id=%s", (user_id,))
+                    data = [
+                        (user_id, code, post["photo"], post.get("caption", ""), time.time())
+                        for code, post in posts.items()
+                    ]
+                    if data:
+                        psycopg2.extras.execute_values(
+                            cur,
+                            "INSERT INTO posts(user_id, code, photo, caption, updated_at) VALUES %s",
+                            data
+                        )
+            finally:
+                conn.close()
 
     def clear_posts(self, user_id: int):
-        with self.lock, self.conn:
-            self.conn.execute("DELETE FROM posts WHERE user_id=?", (user_id,))
+        with self.lock:
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM posts WHERE user_id=%s", (user_id,))
+            finally:
+                conn.close()
 
     # -- настройки --
     def get_settings(self, user_id: int):
         with self.lock:
-            row = self.conn.execute(
-                "SELECT promo, discount FROM settings WHERE user_id=?", (user_id,)
-            ).fetchone()
-        if row is None:
-            return None
-        return {"promo": row["promo"], "discount": float(row["discount"])}
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT promo, discount FROM settings WHERE user_id=%s", (user_id,))
+                    row = cur.fetchone()
+                if row is None:
+                    return None
+                return {"promo": row["promo"], "discount": float(row["discount"])}
+            finally:
+                conn.close()
 
     def set_settings(self, user_id: int, promo: str, discount: float):
-        with self.lock, self.conn:
-            self.conn.execute(
-                "INSERT INTO settings(user_id, promo, discount) VALUES(?,?,?) "
-                "ON CONFLICT(user_id) DO UPDATE SET promo=excluded.promo, discount=excluded.discount",
-                (user_id, promo, discount),
-            )
+        with self.lock:
+            conn = self._get_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO settings(user_id, promo, discount) VALUES(%s, %s, %s)
+                        ON CONFLICT (user_id) DO UPDATE SET promo = EXCLUDED.promo, discount = EXCLUDED.discount
+                        """,
+                        (user_id, promo, discount),
+                    )
+            finally:
+                conn.close()
 
     def backup(self, dest_path: str):
-        """Консистентная копия через SQLite backup API."""
-        with self.lock:
-            dst = sqlite3.connect(dest_path)
-            try:
-                self.conn.backup(dst)
-            finally:
-                dst.close()
+        # Больше не нужен локальный бэкап файла, так как Postgres хранится в облаке Supabase
+        pass
 
 
-def load_json(filename, default_val):
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logging.error(f"Ошибка чтения {filename}: {e}")
-    return default_val
-
-
-def flatten_db(user_db) -> dict:
-    if not isinstance(user_db, dict):
-        return {}
-    flat = {}
-    for k, v in user_db.items():
-        if isinstance(v, dict) and "photo" in v:
-            flat[k] = v
-        elif isinstance(v, dict):
-            flat.update(flatten_db(v))
-    return flat
-
-
-def migrate_from_json(db: Database):
-    """Одноразовый перенос старых JSON-файлов в SQLite."""
-    legacy_db = os.path.join(DATA_DIR, "group_posts_db.json")
-    if os.path.exists(legacy_db):
-        raw = load_json(legacy_db, {})
-        users = raw.get("users", raw) if isinstance(raw, dict) else {}
-        total = 0
-        for uid, posts in users.items():
-            try:
-                uid_int = int(uid)
-            except (TypeError, ValueError):
-                continue
-            flat = flatten_db(posts)
-            if flat:
-                db.replace_posts(uid_int, flat)
-                total += len(flat)
-        os.replace(legacy_db, legacy_db + ".imported")
-        logging.info(f"Перенесено {total} постов из group_posts_db.json в SQLite")
-
-    legacy_settings = os.path.join(DATA_DIR, "user_settings.json")
-    if os.path.exists(legacy_settings):
-        users_settings = load_json(legacy_settings, {})
-        for uid, s in users_settings.items():
-            if not isinstance(s, dict):
-                continue
-            try:
-                uid_int = int(uid)
-            except (TypeError, ValueError):
-                continue
-            db.set_settings(
-                uid_int,
-                str(s.get("promo", DEFAULT_PROMO)),
-                float(s.get("discount", DEFAULT_DISCOUNT)),
-            )
-        os.replace(legacy_settings, legacy_settings + ".imported")
-        logging.info("Перенесены настройки из user_settings.json в SQLite")
-
-
-db = Database(DB_PATH)
-migrate_from_json(db)
-
+db = Database(DATABASE_URL)
 promo_batches: dict[int, list] = {}
 
 
@@ -581,7 +569,7 @@ def parse_excel(data: bytes) -> dict:
             if parsed:
                 prices[parsed[0]] = parsed[1]
     finally:
-        wb.close()
+      wb.close()
     return prices
 
 
@@ -755,7 +743,6 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
 @dp.message(AdminStates.waiting_for_clear_confirm, F.text == BTN_CLEAR_CONFIRM)
 async def confirm_clear(message: Message, state: FSMContext):
     uid = message.from_user.id
-    db.backup(DB_PATH + ".bak")
     db.clear_posts(uid)
     await state.clear()
     await message.answer("🗑 Ваша база даних повністю очищена.", reply_markup=get_main_keyboard())
@@ -943,7 +930,6 @@ async def confirm_sync(message: Message, state: FSMContext):
 
     not_found = [c for c in price_database if c not in flat_posts]
 
-    db.backup(DB_PATH + ".bak")
     db.replace_posts(uid_int, new_user_db)
 
     report = (
@@ -1001,7 +987,7 @@ async def main():
     if os.environ.get("PORT"):
         threading.Thread(target=run_dummy_web_server, daemon=True).start()
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Бот запущено...")
+    logging.info("Бот запущено з PostgreSQL...")
     try:
         await dp.start_polling(bot)
     finally:
