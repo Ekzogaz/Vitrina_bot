@@ -23,7 +23,7 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 # ---------------------------------------------------------------------------
 # Настройки
 # ---------------------------------------------------------------------------
-TOKEN = os.environ.get("9085949690:AAGAQLcj2ZBEG0FU1tqcHT6SZBm73w-gHtk")
+TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не задана переменная окружения BOT_TOKEN")
 
@@ -598,4 +598,198 @@ async def confirm_clear(message: Message, state: FSMContext):
 async def finish_promo_batch(message: Message, state: FSMContext):
     uid = message.from_user.id
     drop_pending(uid)
-    batch = promo_batch
+    batch = promo_batches.pop(uid, [])
+    await state.clear()
+
+    if not batch:
+        await message.answer("❌ Ви не надіслали жодного товару для акції!", reply_markup=get_main_keyboard())
+        return
+
+    settings = get_user_settings(uid)
+    await message.answer(f"🔄 Формую акційні пости (знижка -{settings['discount']:g}%)...")
+
+    sent, failed = 0, 0
+    for item in batch:
+        caption = apply_promo_logic(item["caption"], settings["promo"], settings["discount"])
+        if await send_post(uid, item["photo"], caption):
+            sent += 1
+        else:
+            failed += 1
+        await asyncio.sleep(0.3)
+
+    report = (
+        f"✅ Готово! Надіслано акційних постів: <b>{sent}</b>\n"
+        "Усі ціни зі знижкою, штрихкоди приховані — можете пересилати у групу!"
+    )
+    if failed:
+        report += f"\n⚠️ Не вдалося надіслати: <b>{failed}</b> (деталі в логах)"
+    await message.answer(report, reply_markup=get_main_keyboard())
+
+
+@dp.message(
+    AdminStates.waiting_for_group_table,
+    F.document | (F.text & ~F.text.in_(MENU_TEXTS))
+)
+async def process_table(message: Message, state: FSMContext):
+    uid = str(message.from_user.id)
+    price_database = {}
+
+    if message.document:
+        name = (message.document.file_name or "").lower()
+        if not name.endswith(".xlsx"):
+            await message.answer(
+                "❌ Підтримується лише формат <code>.xlsx</code> (або надішліть текст таблиці).",
+                reply_markup=get_cancel_keyboard(),
+            )
+            return
+        try:
+            file_info = await bot.get_file(message.document.file_id)
+            buf = await bot.download_file(file_info.file_path)
+            price_database = await asyncio.to_thread(parse_excel, buf.read())
+        except Exception as e:
+            await message.answer(
+                f"❌ Помилка читання файлу: {esc(e)}",
+                reply_markup=get_cancel_keyboard(),
+            )
+            return
+    elif message.text:
+        price_database = parse_text_table(message.text)
+
+    if not price_database:
+        await message.answer(
+            "❌ Не вдалося розпізнати штрихкоди та ціни. Перевірте таблицю й спробуйте ще раз.",
+            reply_markup=get_cancel_keyboard(),
+        )
+        return
+
+    flat_posts = user_databases.get(uid, {})
+    matched = [c for c in flat_posts if c in price_database]
+    to_remove = len(flat_posts) - len(matched)
+    not_found = [c for c in price_database if c not in flat_posts]
+
+    if not matched:
+        await state.clear()
+        await message.answer(
+            f"❌ Жоден товар із бази не знайдено в таблиці (розпізнано позицій: {len(price_database)}).\n"
+            "Базу не змінено. Перевірте, що в таблиці саме штрихкоди.",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    await state.update_data(prices=price_database)
+    await state.set_state(AdminStates.waiting_for_sync_confirm)
+    await message.answer(
+        f"🔎 Розпізнано позицій у таблиці: <b>{len(price_database)}</b>\n"
+        f"• У базі: <b>{len(flat_posts)}</b>\n"
+        f"• Збігів (будуть оновлені): <b>{len(matched)}</b>\n"
+        f"• Буде видалено з бази як продані: <b>{to_remove}</b>\n"
+        f"• Є в таблиці, але немає в базі: <b>{len(not_found)}</b>\n\n"
+        "Підтвердити оновлення?",
+        reply_markup=get_confirm_keyboard(BTN_SYNC_CONFIRM),
+    )
+
+
+@dp.message(AdminStates.waiting_for_sync_confirm, F.text == BTN_SYNC_CONFIRM)
+async def confirm_sync(message: Message, state: FSMContext):
+    uid_int = message.from_user.id
+    uid = str(uid_int)
+    data = await state.get_data()
+    price_database = data.get("prices") or {}
+    await state.clear()
+
+    if not price_database:
+        await message.answer("❌ Дані таблиці втрачено. Почніть спочатку.", reply_markup=get_main_keyboard())
+        return
+
+    await message.answer("🔄 Оновлюю ціни та синхронізую базу з 1С...")
+
+    flat_posts = user_databases.get(uid, {})
+    new_user_db = {}
+    removed = 0
+    sent, failed = 0, 0
+
+    for code, post in flat_posts.items():
+        if code in price_database:
+            new_user_db[code] = post
+            caption = update_price_and_clean_caption(post["caption"], price_database[code])
+            if await send_post(uid_int, post["photo"], caption):
+                sent += 1
+            else:
+                failed += 1
+            await asyncio.sleep(0.3)
+        else:
+            removed += 1
+
+    not_found = [c for c in price_database if c not in flat_posts]
+
+    if os.path.exists(DB_FILE):
+        shutil.copy2(DB_FILE, DB_FILE + ".bak")
+    user_databases[uid] = new_user_db
+    save_json(DB_FILE, user_databases)
+
+    report = (
+        f"✅ Готово!\n"
+        f"• Надіслано оновлених постів: <b>{sent}</b>\n"
+        f"• Видалено з бази (продано / немає в 1С): <b>{removed} шт.</b>\n"
+        f"• У вашій базі тепер актуальних товарів: <b>{len(new_user_db)} шт.</b>"
+    )
+    if failed:
+        report += f"\n• ⚠️ Не вдалося надіслати: <b>{failed}</b> (деталі в логах)"
+    if not_found:
+        preview = ", ".join(not_found[:20])
+        extra = f" (і ще {len(not_found) - 20} шт.)" if len(not_found) > 20 else ""
+        report += (
+            f"\n\n⚠️ <b>У таблиці 1С є товари, яких немає у вашій базі ({len(not_found)} шт.):</b>\n"
+            f"<code>{preview}{extra}</code>"
+        )
+    await message.answer(report, reply_markup=get_main_keyboard())
+
+
+@dp.message(AdminStates.waiting_for_sync_confirm)
+async def sync_confirm_reminder(message: Message):
+    await message.answer(
+        "Натисніть «✅ Так, оновити базу» або поверніться в головне меню.",
+        reply_markup=get_confirm_keyboard(BTN_SYNC_CONFIRM),
+    )
+
+
+@dp.message(AdminStates.waiting_for_custom_promo, F.text)
+async def save_custom_promo(message: Message, state: FSMContext):
+    settings = get_user_settings(message.from_user.id)
+    settings["promo"] = message.text.strip()
+    save_json(SETTINGS_FILE, users_settings)
+    await state.clear()
+    await message.answer("✅ Текст акції змінено для вашого аккаунта!", reply_markup=get_main_keyboard())
+
+
+@dp.message(AdminStates.waiting_for_custom_discount, F.text)
+async def save_custom_discount(message: Message, state: FSMContext):
+    try:
+        val = float(message.text.strip().replace("%", "").replace(",", "."))
+    except ValueError:
+        await message.answer("❌ Введіть число:", reply_markup=get_cancel_keyboard())
+        return
+    if not (0 < val < 100):
+        await message.answer("❌ Відсоток має бути більшим за 0 і меншим за 100:", reply_markup=get_cancel_keyboard())
+        return
+    settings = get_user_settings(message.from_user.id)
+    settings["discount"] = val
+    save_json(SETTINGS_FILE, users_settings)
+    await state.clear()
+    await message.answer(f"✅ Знижку змінено на: {val:g}% для вашого аккаунта!", reply_markup=get_main_keyboard())
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    if os.environ.get("PORT"):
+        threading.Thread(target=run_dummy_web_server, daemon=True).start()
+    await bot.delete_webhook(drop_pending_updates=True)
+    logging.info("Бот запущено...")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
