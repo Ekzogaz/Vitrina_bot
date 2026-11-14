@@ -23,7 +23,7 @@ from aiogram.types import KeyboardButton, Message, ReplyKeyboardMarkup
 # ---------------------------------------------------------------------------
 # Настройки
 # ---------------------------------------------------------------------------
-TOKEN = os.environ.get("BOT_TOKEN")
+TOKEN = os.environ.get("9085949690:AAGAQLcj2ZBEG0FU1tqcHT6SZBm73w-gHtk")
 if not TOKEN:
     raise SystemExit("Не задана переменная окружения BOT_TOKEN")
 
