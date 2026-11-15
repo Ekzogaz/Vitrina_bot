@@ -42,7 +42,6 @@ if not DATABASE_URL:
 
 MIN_CODE_LEN = 5
 CAPTION_LIMIT = 1024
-SUMMARY_DELAY = 1.5
 
 DEFAULT_PROMO = "АКЦІЙНА ПРОПОЗИЦІЯ"
 DEFAULT_DISCOUNT = 6.0
@@ -65,7 +64,6 @@ class Database:
         self._init_db()
 
     def _get_conn(self):
-        # Автоматическое переподключение и режим autocommit для простоты
         conn = psycopg2.connect(self.dsn, cursor_factory=psycopg2.extras.DictCursor)
         conn.autocommit = True
         return conn
@@ -144,7 +142,6 @@ class Database:
                 conn.close()
 
     def replace_posts(self, user_id: int, posts: dict):
-        """Полная замена набора постов пользователя (для синхронизации)."""
         with self.lock:
             conn = self._get_conn()
             try:
@@ -202,7 +199,6 @@ class Database:
                 conn.close()
 
     def backup(self, dest_path: str):
-        # Больше не нужен локальный бэкап файла, так как Postgres хранится в облаке Supabase
         pass
 
 
@@ -331,39 +327,52 @@ def get_edit_inline_keyboard():
 
 
 # ---------------------------------------------------------------------------
-# Накопитель уведомлений
+# Надежная очередь для массового сохранения постів без втрат
 # ---------------------------------------------------------------------------
-_pending: dict[int, dict] = {}
+_import_queues: dict[int, list] = {}
+_import_tasks: dict[int, asyncio.Task] = {}
 
 
-async def _flush_after(user_id: int, delay: float):
-    await asyncio.sleep(delay)
-    entry = _pending.pop(user_id, None)
-    if not entry:
+async def _process_queue(user_id: int, message: Message):
+    await asyncio.sleep(1.0)
+    queue = _import_queues.pop(user_id, None)
+    _import_tasks.pop(user_id, None)
+    
+    if not queue:
         return
+
+    added = 0
+    updated = 0
+    nocode = 0
+
+    for item in queue:
+        caption = item["caption"]
+        photo = item["photo"]
+        code = extract_code_from_text(caption)
+
+        if code:
+            is_update = db.upsert_post(user_id, code, photo, caption)
+            if is_update:
+                updated += 1
+            else:
+                added += 1
+        else:
+            nocode += 1
+
+    total = get_user_total_count(user_id)
+    lines = []
+    if added:
+        lines.append(f"✅ Додано нових товарів: <b>{added}</b>")
+    if updated:
+        lines.append(f"🔄 Оновлено в базі: <b>{updated}</b>")
+    if nocode:
+        lines.append(f"ℹ️ Без штрихкоду (пропущено): <b>{nocode}</b>")
+    lines.append(f"📦 Всього у базі: <b>{total} шт.</b>")
+
     try:
-        await entry["send"](entry["stats"])
+        await message.answer("\n".join(lines), reply_markup=get_main_keyboard())
     except Exception:
-        logging.exception("Ошибка отправки итогового сообщения")
-
-
-def schedule_summary(user_id: int, send, **inc):
-    entry = _pending.get(user_id)
-    if entry is None:
-        entry = {"stats": {}, "send": send, "task": None}
-        _pending[user_id] = entry
-    for k, v in inc.items():
-        entry["stats"][k] = entry["stats"].get(k, 0) + v
-    entry["send"] = send
-    if entry["task"]:
-        entry["task"].cancel()
-    entry["task"] = asyncio.create_task(_flush_after(user_id, SUMMARY_DELAY))
-
-
-def drop_pending(user_id: int):
-    entry = _pending.pop(user_id, None)
-    if entry and entry["task"]:
-        entry["task"].cancel()
+        logging.exception("Помилка відправки звіту про імпорт")
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +578,7 @@ def parse_excel(data: bytes) -> dict:
             if parsed:
                 prices[parsed[0]] = parsed[1]
     finally:
-      wb.close()
+        wb.close()
     return prices
 
 
@@ -596,7 +605,6 @@ def parse_text_table(text: str) -> dict:
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     uid = message.from_user.id
-    drop_pending(uid)
     promo_batches.pop(uid, None)
     s = get_user_settings(uid)
     await message.answer(
@@ -615,7 +623,6 @@ async def cmd_start(message: Message, state: FSMContext):
 async def cancel_to_main_menu(message: Message, state: FSMContext):
     uid = message.from_user.id
     await state.clear()
-    drop_pending(uid)
     promo_batches.pop(uid, None)
     await message.answer("🏠 Ви повернулися до головного меню.", reply_markup=get_main_keyboard())
 
@@ -625,15 +632,11 @@ async def collect_promo_photos(message: Message, state: FSMContext):
     uid = message.from_user.id
     batch = promo_batches.setdefault(uid, [])
     batch.append({"photo": message.photo[-1].file_id, "caption": message.caption or ""})
-
-    async def send(stats):
-        count = len(promo_batches.get(uid, []))
-        await message.answer(
-            f"✅ Додано товарів для акції: <b>{count}</b>. Надсилайте ще або натисніть «Готово».",
-            reply_markup=get_promo_keyboard(),
-        )
-
-    schedule_summary(uid, send)
+    count = len(batch)
+    await message.answer(
+        f"✅ Додано товарів для акції: <b>{count}</b>. Надсилайте ще або натисніть «Готово».",
+        reply_markup=get_promo_keyboard(),
+    )
 
 
 @dp.message(F.photo)
@@ -643,26 +646,16 @@ async def auto_collect_posts(message: Message, state: FSMContext):
 
     uid_int = message.from_user.id
     caption = message.caption or ""
-    code = extract_code_from_text(caption)
+    photo = message.photo[-1].file_id
 
-    if code:
-        is_update = db.upsert_post(uid_int, code, message.photo[-1].file_id, caption)
-        inc = {"updated": 1} if is_update else {"added": 1}
-    else:
-        inc = {"nocode": 1}
+    if uid_int not in _import_queues:
+        _import_queues[uid_int] = []
+    _import_queues[uid_int].append({"photo": photo, "caption": caption})
 
-    async def send(stats):
-        lines = []
-        if stats.get("added"):
-            lines.append(f"✅ Додано нових товарів: <b>{stats['added']}</b>")
-        if stats.get("updated"):
-            lines.append(f"🔄 Оновлено (вже були в базі): <b>{stats['updated']}</b>")
-        if stats.get("nocode"):
-            lines.append(f"ℹ️ Без коду в тексті (не додано): <b>{stats['nocode']}</b>")
-        lines.append(f"📦 Всього у базі: <b>{get_user_total_count(uid_int)} шт.</b>")
-        await message.answer("\n".join(lines), reply_markup=get_main_keyboard())
-
-    schedule_summary(uid_int, send, **inc)
+    if uid_int in _import_tasks:
+        _import_tasks[uid_int].cancel()
+    
+    _import_tasks[uid_int] = asyncio.create_task(_process_queue(uid_int, message))
 
 
 @dp.message(F.text.in_(MENU_TEXTS))
@@ -670,7 +663,6 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
     uid_int = message.from_user.id
     text = message.text
     await state.clear()
-    drop_pending(uid_int)
     promo_batches.pop(uid_int, None)
 
     settings = get_user_settings(uid_int)
@@ -751,7 +743,6 @@ async def confirm_clear(message: Message, state: FSMContext):
 @dp.message(AdminStates.waiting_for_promo_photos, F.text == BTN_PROMO_DONE)
 async def finish_promo_batch(message: Message, state: FSMContext):
     uid = message.from_user.id
-    drop_pending(uid)
     batch = promo_batches.pop(uid, [])
     await state.clear()
 
