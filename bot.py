@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import html
 import http.server
 import io
@@ -9,6 +10,8 @@ import os
 import re
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 import openpyxl
 import psycopg2
@@ -83,10 +86,12 @@ class Database:
                             PRIMARY KEY (user_id, code)
                         );
                         CREATE TABLE IF NOT EXISTS settings (
-                            user_id BIGINT PRIMARY KEY,
-                            promo   TEXT    NOT NULL,
-                            discount DOUBLE PRECISION NOT NULL
+                            user_id   BIGINT PRIMARY KEY,
+                            promo     TEXT    NOT NULL,
+                            discount  DOUBLE PRECISION NOT NULL,
+                            sheet_url TEXT    NOT NULL DEFAULT ''
                         );
+                        ALTER TABLE settings ADD COLUMN IF NOT EXISTS sheet_url TEXT NOT NULL DEFAULT '';
                     """)
             finally:
                 conn.close()
@@ -175,26 +180,47 @@ class Database:
             conn = self._get_conn()
             try:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT promo, discount FROM settings WHERE user_id=%s", (user_id,))
+                    cur.execute(
+                        "SELECT promo, discount, COALESCE(sheet_url, '') AS sheet_url FROM settings WHERE user_id=%s",
+                        (user_id,),
+                    )
                     row = cur.fetchone()
                 if row is None:
                     return None
-                return {"promo": row["promo"], "discount": float(row["discount"])}
+                return {
+                    "promo": row["promo"],
+                    "discount": float(row["discount"]),
+                    "sheet_url": row["sheet_url"] or "",
+                }
             finally:
                 conn.close()
 
-    def set_settings(self, user_id: int, promo: str, discount: float):
+    def set_settings(self, user_id: int, promo: str, discount: float, sheet_url: str | None = None):
         with self.lock:
             conn = self._get_conn()
             try:
                 with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO settings(user_id, promo, discount) VALUES(%s, %s, %s)
-                        ON CONFLICT (user_id) DO UPDATE SET promo = EXCLUDED.promo, discount = EXCLUDED.discount
-                        """,
-                        (user_id, promo, discount),
-                    )
+                    if sheet_url is None:
+                        cur.execute(
+                            """
+                            INSERT INTO settings(user_id, promo, discount, sheet_url) VALUES(%s, %s, %s, '')
+                            ON CONFLICT (user_id) DO UPDATE SET
+                            promo = EXCLUDED.promo,
+                            discount = EXCLUDED.discount
+                            """,
+                            (user_id, promo, discount),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO settings(user_id, promo, discount, sheet_url) VALUES(%s, %s, %s, %s)
+                            ON CONFLICT (user_id) DO UPDATE SET
+                            promo = EXCLUDED.promo,
+                            discount = EXCLUDED.discount,
+                            sheet_url = EXCLUDED.sheet_url
+                            """,
+                            (user_id, promo, discount, sheet_url),
+                        )
             finally:
                 conn.close()
 
@@ -210,8 +236,8 @@ last_nocode_posts: dict[int, list] = {}
 def get_user_settings(user_id: int) -> dict:
     s = db.get_settings(user_id)
     if s is None:
-        s = {"promo": DEFAULT_PROMO, "discount": DEFAULT_DISCOUNT}
-        db.set_settings(user_id, s["promo"], s["discount"])
+        s = {"promo": DEFAULT_PROMO, "discount": DEFAULT_DISCOUNT, "sheet_url": ""}
+        db.set_settings(user_id, s["promo"], s["discount"], s["sheet_url"])
     return s
 
 
@@ -255,10 +281,12 @@ class AdminStates(StatesGroup):
     waiting_for_promo_photos = State()
     waiting_for_clear_confirm = State()
     waiting_for_edit_caption = State()
+    waiting_for_sheet_url = State()
 
 
 BTN_SYNC = "🔄 Отримати оновлені пости за таблицею"
 BTN_PROMO = "🔥 Акція"
+BTN_SHEET_SETUP = "🔗 Підключити Google Таблицю"
 BTN_PROMO_TEXT = "✍️ Ввести свій текст акції"
 BTN_DISCOUNT = "🔢 Ввести свій % знижки"
 BTN_SETTINGS = "⚙️ Поточні налаштування"
@@ -269,8 +297,20 @@ BTN_BACK = "🔙 Повернутися в головне меню"
 BTN_SYNC_CONFIRM = "✅ Так, оновити базу"
 BTN_CLEAR_CONFIRM = "✅ Так, очистити базу"
 BTN_EDIT_CANCEL = "❌ Скасувати редагування"
+BTN_SYNC_FROM_SHEET = "☁️ Взяти дані з моєї Google Таблиці"
+BTN_SHEET_CLEAR = "🗑 Відв'язати Google Таблицю"
 
-MENU_TEXTS = {BTN_SYNC, BTN_PROMO, BTN_PROMO_TEXT, BTN_DISCOUNT, BTN_SETTINGS, BTN_STATS, BTN_CLEAR, BTN_BACK}
+MENU_TEXTS = {
+    BTN_SYNC,
+    BTN_PROMO,
+    BTN_SHEET_SETUP,
+    BTN_PROMO_TEXT,
+    BTN_DISCOUNT,
+    BTN_SETTINGS,
+    BTN_STATS,
+    BTN_CLEAR,
+    BTN_BACK,
+}
 
 NO_AUTOCOLLECT_STATES = {
     AdminStates.waiting_for_group_table.state,
@@ -280,6 +320,7 @@ NO_AUTOCOLLECT_STATES = {
     AdminStates.waiting_for_custom_promo.state,
     AdminStates.waiting_for_custom_discount.state,
     AdminStates.waiting_for_edit_caption.state,
+    AdminStates.waiting_for_sheet_url.state,
 }
 
 
@@ -287,6 +328,7 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_SYNC), KeyboardButton(text=BTN_PROMO)],
+            [KeyboardButton(text=BTN_SHEET_SETUP)],
             [KeyboardButton(text=BTN_PROMO_TEXT), KeyboardButton(text=BTN_DISCOUNT)],
             [KeyboardButton(text=BTN_SETTINGS), KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_CLEAR)],
         ],
@@ -303,6 +345,22 @@ def get_promo_keyboard():
 
 def get_cancel_keyboard():
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_BACK)]], resize_keyboard=True)
+
+
+def get_sync_source_keyboard(has_sheet: bool):
+    rows = []
+    if has_sheet:
+        rows.append([KeyboardButton(text=BTN_SYNC_FROM_SHEET)])
+    rows.append([KeyboardButton(text=BTN_BACK)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def get_sheet_setup_keyboard(has_sheet: bool):
+    rows = []
+    if has_sheet:
+        rows.append([KeyboardButton(text=BTN_SHEET_CLEAR)])
+    rows.append([KeyboardButton(text=BTN_BACK)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def get_confirm_keyboard(confirm_text: str):
@@ -323,7 +381,6 @@ def get_edit_inline_keyboard(prefill_text: str = ""):
     buttons = [
         [InlineKeyboardButton(text="✏️ Редагувати", callback_data="edit_caption")]
     ]
-    # switch_inline_query_current_chat підставляє поточний текст у поле вводу, якщо він вміщується у ліміт Telegram (~256 символів)
     if prefill_text and len(prefill_text) <= 250:
         buttons.append([
             InlineKeyboardButton(
@@ -594,7 +651,7 @@ async def send_post(chat_id: int, photo: str, caption: str, raw_prefill: str = "
 
 
 # ---------------------------------------------------------------------------
-# Разбор таблицы 1С
+# Разбор таблицы 1С и Google Таблиц
 # ---------------------------------------------------------------------------
 def as_digits(cell):
     if isinstance(cell, bool) or cell is None:
@@ -678,6 +735,44 @@ def parse_text_table(text: str) -> dict:
     return prices
 
 
+def build_google_sheet_csv_url(raw_url: str) -> str:
+    """Превращает любую ссылку на Google Таблицу (включая gid конкретного листа) в прямую CSV-ссылку."""
+    url = raw_url.strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+    if not m:
+        if "output=csv" in url or "format=csv" in url:
+            return url
+        raise ValueError("Невірне посилання. Скопіюйте посилання з адресного рядка Google Таблиці.")
+
+    sheet_id = m.group(1)
+    gid_match = re.search(r"[#?&]gid=(\d+)", url)
+    gid_part = f"&gid={gid_match.group(1)}" if gid_match else ""
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv{gid_part}"
+
+
+def fetch_google_sheet_prices(raw_url: str) -> dict:
+    csv_url = build_google_sheet_csv_url(raw_url)
+    req = urllib.request.Request(csv_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        content_type = resp.headers.get("Content-Type", "")
+        raw_bytes = resp.read()
+
+    if "text/html" in content_type.lower():
+        raise ValueError(
+            "Таблиця закрита для доступу! Відкрийте в Google Таблиці «Налаштування доступу» → «Усі, хто має посилання» (Читач)."
+        )
+
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+    prices = {}
+    reader = csv.reader(io.StringIO(text))
+    for row in reader:
+        cells = [c for c in row if c is not None and str(c).strip() != ""]
+        parsed = parse_row(cells)
+        if parsed:
+            prices[parsed[0]] = parsed[1]
+    return prices
+
+
 # ---------------------------------------------------------------------------
 # Хэндлеры
 # ---------------------------------------------------------------------------
@@ -687,11 +782,13 @@ async def cmd_start(message: Message, state: FSMContext):
     uid = message.from_user.id
     promo_batches.pop(uid, None)
     s = get_user_settings(uid)
+    sheet_status = "✅ підключена" if s.get("sheet_url") else "❌ не підключена"
     await message.answer(
         "Привіт! 👋 Я ваш персональний помічник для роботи з Вітриною.\n\n"
         f"📋 Ваші поточні налаштування:\n"
         f"• Акція: {esc(s['promo'])}\n"
-        f"• Знижка: {s['discount']:g}%\n\n"
+        f"• Знижка: {s['discount']:g}%\n"
+        f"• Google Таблиця: {sheet_status}\n\n"
         "• Пересилайте звичайні пости сюди — база захищена від дублікатів.\n"
         "• Натискайте «🔥 Акція», щоб переслати товари і на лету отримати розрахунок знижки!\n"
         "• Під кожним відправленим постом є кнопка «✏️ Редагувати».",
@@ -747,6 +844,7 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
 
     settings = get_user_settings(uid_int)
     total = get_user_total_count(uid_int)
+    has_sheet = bool(settings.get("sheet_url"))
 
     if text == BTN_SYNC:
         if total == 0:
@@ -756,11 +854,34 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
             )
             return
         await state.set_state(AdminStates.waiting_for_group_table)
+        hint_sheet = (
+            "\n\n☁️ Або натисніть кнопку нижче, щоб завантажити дані з вашої прив'язаної Google Таблиці!"
+            if has_sheet
+            else "\n\n💡 <i>Порада: ви можете один раз прив'язати свою Google Таблицю через кнопку «🔗 Підключити Google Таблицю», щоб не скидати файл щоразу.</i>"
+        )
         await message.answer(
             f"📥 У вашій базі даних збережено виробів: <b>{total} шт.</b>\n\n"
-            "Надішліть файл Excel (<code>.xlsx</code>) або скопіюйте текст із таблиці ціноутворення 1С.\n"
+            "Надішліть файл Excel (<code>.xlsx</code>) або скопіюйте текст із таблиці ціноутворення 1С."
+            f"{hint_sheet}\n"
             "<i>(Після підтвердження все, чого немає в цій таблиці, буде видалено як продане)</i>",
-            reply_markup=get_cancel_keyboard(),
+            reply_markup=get_sync_source_keyboard(has_sheet),
+        )
+
+    elif text == BTN_SHEET_SETUP:
+        await state.set_state(AdminStates.waiting_for_sheet_url)
+        current_info = (
+            f"🔗 Зараз підключена таблиця:\n<code>{esc(settings['sheet_url'])}</code>\n\n"
+            "Щоб замінити її, надішліть нове посилання на Google Таблицю (або відв'яжіть поточну кнопкою нижче):"
+            if has_sheet
+            else "🔗 <b>Підключення особистої Google Таблиці</b>\n\n"
+                 "1. Відкрийте вашу Google Таблицю з кодами та цінами.\n"
+                 "2. Натисніть «Поділитися» → «Усі, хто має посилання» (роль: <b>Читач</b>).\n"
+                 "3. Скопіюйте посилання з браузера та надішліть його сюди.\n\n"
+                 "<i>Посилання закріпиться лише за вашим обліковим записом у базі даних.</i>"
+        )
+        await message.answer(
+            current_info,
+            reply_markup=get_sheet_setup_keyboard(has_sheet),
         )
 
     elif text == BTN_PROMO:
@@ -774,11 +895,13 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
         )
 
     elif text == BTN_STATS:
+        sheet_label = "✅ підключена" if has_sheet else "❌ не підключена"
         await message.answer(
             f"📊 Статистика:\n"
             f"• Загалом збережених товарів у вашій базі: <b>{total} шт.</b>\n"
             f"• Ваша поточна акція: {esc(settings['promo'])}\n"
-            f"• Ваша поточна знижка: {settings['discount']:g}%",
+            f"• Ваша поточна знижка: {settings['discount']:g}%\n"
+            f"• Google Таблиця: {sheet_label}",
             reply_markup=get_main_keyboard(),
         )
 
@@ -804,12 +927,62 @@ async def handle_menu_buttons(message: Message, state: FSMContext):
         )
 
     elif text == BTN_SETTINGS:
+        sheet_line = (
+            f"\n• Google Таблиця: <code>{esc(settings['sheet_url'])}</code>"
+            if has_sheet
+            else "\n• Google Таблиця: не підключена"
+        )
         await message.answer(
             f"📋 Ваші поточні налаштування:\n"
             f"• Акція: {esc(settings['promo'])}\n"
-            f"• Знижка: {settings['discount']:g}%",
+            f"• Знижка: {settings['discount']:g}%"
+            f"{sheet_line}",
             reply_markup=get_main_keyboard(),
         )
+
+
+@dp.message(AdminStates.waiting_for_sheet_url, F.text == BTN_SHEET_CLEAR)
+async def clear_user_sheet_url(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    s = get_user_settings(uid)
+    db.set_settings(uid, s["promo"], s["discount"], sheet_url="")
+    await state.clear()
+    await message.answer("🗑 Посилання на Google Таблицю видалено з ваших налаштувань.", reply_markup=get_main_keyboard())
+
+
+@dp.message(AdminStates.waiting_for_sheet_url, F.text)
+async def save_user_sheet_url(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    raw_url = message.text.strip()
+    has_sheet = bool(get_user_settings(uid).get("sheet_url"))
+
+    await message.answer("⏳ Перевіряю доступ до Google Таблиці...")
+    try:
+        prices = await asyncio.to_thread(fetch_google_sheet_prices, raw_url)
+    except Exception as e:
+        await message.answer(
+            f"❌ Не вдалося прочитати таблицю: {esc(e)}\n\nПеревірте посилання та права доступу й спробуйте ще раз:",
+            reply_markup=get_sheet_setup_keyboard(has_sheet),
+        )
+        return
+
+    if not prices:
+        await message.answer(
+            "⚠️ Таблиця відкрилася, але в ній не знайдено жодного штрихкоду та ціни.\n"
+            "Перевірте, що в таблиці є стовпці зі штрихкодом та ціною, і надішліть посилання ще раз:",
+            reply_markup=get_sheet_setup_keyboard(has_sheet),
+        )
+        return
+
+    s = get_user_settings(uid)
+    db.set_settings(uid, s["promo"], s["discount"], sheet_url=raw_url)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Google Таблицю успішно підключено до вашого профілю!</b>\n"
+        f"• Розпізнано позицій у таблиці: <b>{len(prices)} шт.</b>\n\n"
+        "Тепер при натисканні «🔄 Отримати оновлені пости за таблицею» ви зможете оновлювати базу в один клік напряму з неї!",
+        reply_markup=get_main_keyboard(),
+    )
 
 
 @dp.message(AdminStates.waiting_for_clear_confirm, F.text == BTN_CLEAR_CONFIRM)
@@ -889,7 +1062,6 @@ async def on_edit_caption(callback: CallbackQuery, state: FSMContext):
 
 
 def _insert_code_into_caption(old_caption: str, code_input: str) -> str:
-    """Акуратно вставляє рядок 'Код XXXXX' у текст поста (перед рядком Ціна, якщо він є)."""
     digits = normalize_code(code_input)
     code_line = f"Код {digits}"
     if not old_caption:
@@ -898,7 +1070,6 @@ def _insert_code_into_caption(old_caption: str, code_input: str) -> str:
     lines = old_caption.splitlines()
     for i, line in enumerate(lines):
         if re.search(r"ціна", line, re.IGNORECASE):
-            # Вставляємо одразу перед Ціною (прибираючи зайвий порожній рядок між кодом і ціною, якщо треба)
             lines.insert(i, code_line)
             return "\n".join(lines)
 
@@ -914,7 +1085,6 @@ async def save_edited_caption(message: Message, state: FSMContext):
     old_caption = data.get("edit_old_caption") or ""
     photo_id = data.get("edit_photo_id")
 
-    # Прибираємо можливе згадування @bot_username на початку, якщо користувач скористався switch_inline_query_current_chat
     raw_input = re.sub(r"^@\w+\s*", "", message.text).strip()
     await state.clear()
 
@@ -922,7 +1092,6 @@ async def save_edited_caption(message: Message, state: FSMContext):
         await message.answer("❌ Помилка сесії редагування. Спробуйте ще раз.", reply_markup=get_main_keyboard())
         return
 
-    # Перевіряємо: користувач надіслав лише код (наприклад "Код 100012345" або "100012345") чи повний текст?
     is_only_code = bool(
         re.fullmatch(r"(?:(?:штрихкод|код)[ \t]*[:\-]?[ \t]*)?\d[\d ]*", raw_input, re.IGNORECASE)
         and len(normalize_code(raw_input)) >= MIN_CODE_LEN
@@ -950,7 +1119,6 @@ async def save_edited_caption(message: Message, state: FSMContext):
         )
         return
 
-    # Якщо у новому підписі є валідний штрихкод і відоме фото — автоматично зберігаємо товар у базу!
     plain_caption = re.sub(r"<[^>]+>", "", new_caption)
     code = extract_code_from_text(plain_caption)
     if code and photo_id:
@@ -966,42 +1134,7 @@ async def save_edited_caption(message: Message, state: FSMContext):
         await message.answer("✅ Підпис до поста успішно оновлено!", reply_markup=get_main_keyboard())
 
 
-@dp.message(
-    AdminStates.waiting_for_group_table,
-    F.document | (F.text & ~F.text.in_(MENU_TEXTS))
-)
-async def process_table(message: Message, state: FSMContext):
-    uid = message.from_user.id
-    price_database = {}
-
-    if message.document:
-        name = (message.document.file_name or "").lower()
-        if not name.endswith(".xlsx"):
-            await message.answer(
-                "❌ Підтримується лише формат <code>.xlsx</code> (або надішліть текст таблиці).",
-                reply_markup=get_cancel_keyboard(),
-            )
-            return
-        try:
-            file_info = await bot.get_file(message.document.file_id)
-            buf = await bot.download_file(file_info.file_path)
-            price_database = await asyncio.to_thread(parse_excel, buf.read())
-        except Exception as e:
-            await message.answer(
-                f"❌ Помилка читання файлу: {esc(e)}",
-                reply_markup=get_cancel_keyboard(),
-            )
-            return
-    elif message.text:
-        price_database = parse_text_table(message.text)
-
-    if not price_database:
-        await message.answer(
-            "❌ Не вдалося розпізнати штрихкоди та ціни. Перевірте таблицю й спробуйте ще раз.",
-            reply_markup=get_cancel_keyboard(),
-        )
-        return
-
+async def _prepare_sync_confirmation(message: Message, state: FSMContext, uid: int, price_database: dict):
     flat_posts = db.get_posts(uid)
     matched = [c for c in flat_posts if c in price_database]
     to_remove = len(flat_posts) - len(matched)
@@ -1027,6 +1160,81 @@ async def process_table(message: Message, state: FSMContext):
         "Підтвердити оновлення?",
         reply_markup=get_confirm_keyboard(BTN_SYNC_CONFIRM),
     )
+
+
+@dp.message(AdminStates.waiting_for_group_table, F.text == BTN_SYNC_FROM_SHEET)
+async def process_google_sheet_sync(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    settings = get_user_settings(uid)
+    sheet_url = settings.get("sheet_url") or ""
+
+    if not sheet_url:
+        await message.answer(
+            "❌ У вас ще не підключена Google Таблиця. Натисніть «🔗 Підключити Google Таблицю» в головному меню.",
+            reply_markup=get_cancel_keyboard(),
+        )
+        return
+
+    await message.answer("☁️ Завантажую свіжі дані з вашої Google Таблиці...")
+    try:
+        price_database = await asyncio.to_thread(fetch_google_sheet_prices, sheet_url)
+    except Exception as e:
+        await message.answer(
+            f"❌ Помилка завантаження Google Таблиці: {esc(e)}\n"
+            "Ви можете перевірити доступ до таблиці або надіслати файл <code>.xlsx</code> вручну.",
+            reply_markup=get_sync_source_keyboard(True),
+        )
+        return
+
+    if not price_database:
+        await message.answer(
+            "❌ У Google Таблиці не вдалося розпізнати штрихкоди та ціни. Перевірте таблицю або надішліть <code>.xlsx</code>.",
+            reply_markup=get_sync_source_keyboard(True),
+        )
+        return
+
+    await _prepare_sync_confirmation(message, state, uid, price_database)
+
+
+@dp.message(
+    AdminStates.waiting_for_group_table,
+    F.document | (F.text & ~F.text.in_(MENU_TEXTS))
+)
+async def process_table(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    settings = get_user_settings(uid)
+    has_sheet = bool(settings.get("sheet_url"))
+    price_database = {}
+
+    if message.document:
+        name = (message.document.file_name or "").lower()
+        if not name.endswith(".xlsx"):
+            await message.answer(
+                "❌ Підтримується лише формат <code>.xlsx</code> (або надішліть текст таблиці).",
+                reply_markup=get_sync_source_keyboard(has_sheet),
+            )
+            return
+        try:
+            file_info = await bot.get_file(message.document.file_id)
+            buf = await bot.download_file(file_info.file_path)
+            price_database = await asyncio.to_thread(parse_excel, buf.read())
+        except Exception as e:
+            await message.answer(
+                f"❌ Помилка читання файлу: {esc(e)}",
+                reply_markup=get_sync_source_keyboard(has_sheet),
+            )
+            return
+    elif message.text:
+        price_database = parse_text_table(message.text)
+
+    if not price_database:
+        await message.answer(
+            "❌ Не вдалося розпізнати штрихкоди та ціни. Перевірте таблицю й спробуйте ще раз.",
+            reply_markup=get_sync_source_keyboard(has_sheet),
+        )
+        return
+
+    await _prepare_sync_confirmation(message, state, uid, price_database)
 
 
 @dp.message(AdminStates.waiting_for_sync_confirm, F.text == BTN_SYNC_CONFIRM)
