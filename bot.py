@@ -204,6 +204,7 @@ class Database:
 
 db = Database(DATABASE_URL)
 promo_batches: dict[int, list] = {}
+last_nocode_posts: dict[int, list] = {}
 
 
 def get_user_settings(user_id: int) -> dict:
@@ -318,10 +319,28 @@ def get_edit_cancel_keyboard():
     )
 
 
-def get_edit_inline_keyboard():
+def get_edit_inline_keyboard(prefill_text: str = ""):
+    buttons = [
+        [InlineKeyboardButton(text="✏️ Редагувати", callback_data="edit_caption")]
+    ]
+    # switch_inline_query_current_chat підставляє поточний текст у поле вводу, якщо він вміщується у ліміт Telegram (~256 символів)
+    if prefill_text and len(prefill_text) <= 250:
+        buttons.append([
+            InlineKeyboardButton(
+                text="📝 Дописати у поле вводу",
+                switch_inline_query_current_chat=prefill_text,
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_nocode_inline_keyboard(count: int):
     return InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="✏️ Редагувати", callback_data="edit_caption")
+            InlineKeyboardButton(
+                text=f"📤 Надіслати пости без штрихкоду ({count} шт.)",
+                callback_data="show_nocode_posts"
+            )
         ]]
     )
 
@@ -334,16 +353,19 @@ _import_tasks: dict[int, asyncio.Task] = {}
 
 
 async def _process_queue(user_id: int, message: Message):
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(1.5)
     queue = _import_queues.pop(user_id, None)
     _import_tasks.pop(user_id, None)
-    
+
     if not queue:
         return
 
     added = 0
-    updated = 0
-    nocode_samples = []
+    updated_codes = []
+    batch_dup_codes = []
+    nocode_items = []
+
+    seen_in_batch = set()
 
     for item in queue:
         caption = item["caption"]
@@ -351,35 +373,85 @@ async def _process_queue(user_id: int, message: Message):
         code = extract_code_from_text(caption)
 
         if code:
+            if code in seen_in_batch:
+                batch_dup_codes.append(code)
+                continue
+            seen_in_batch.add(code)
+
             is_update = db.upsert_post(user_id, code, photo, caption)
             if is_update:
-                updated += 1
+                updated_codes.append(code)
             else:
                 added += 1
         else:
-            snippet = caption.replace("\n", " ")[:30] + "..." if caption else "Без підпису"
-            nocode_samples.append(esc(snippet))
+            nocode_items.append({"photo": photo, "caption": caption})
 
     total = get_user_total_count(user_id)
     lines = [
         "📊 <b>Результат масового імпорту:</b>",
         f"• Додано нових товарів: <b>{added}</b>",
-        f"• Оновлено в базі: <b>{updated}</b>"
     ]
-    
-    if nocode_samples:
-        lines.append(f"• ℹ️ <b>Без штрихкоду (не додано): {len(nocode_samples)} шт.</b>")
-        preview = "\n".join([f"  – <code>{s}</code>" for s in nocode_samples[:5]])
-        lines.append(f"Приклади проблемних постів:\n{preview}")
-        if len(nocode_samples) > 5:
-            lines.append(f"<i>(та ще {len(nocode_samples) - 5} постів)</i>")
+
+    if batch_dup_codes:
+        unique_batch_dups = list(dict.fromkeys(batch_dup_codes))
+        codes_str = ", ".join(f"<code>{c}</code>" for c in unique_batch_dups)
+        lines.append(
+            f"• 🔄 Дублікати всередині пачки (пропущено <b>{len(batch_dup_codes)}</b> шт.):\n  {codes_str}"
+        )
+
+    if updated_codes:
+        unique_updated = list(dict.fromkeys(updated_codes))
+        codes_str = ", ".join(f"<code>{c}</code>" for c in unique_updated)
+        lines.append(
+            f"• ♻️ Вже були в базі (оновлено <b>{len(updated_codes)}</b> шт.):\n  {codes_str}"
+        )
+
+    if nocode_items:
+        last_nocode_posts[user_id] = nocode_items
+        lines.append(f"• ⚠️ Без штрихкоду (не додано): <b>{len(nocode_items)} шт.</b>")
+    else:
+        last_nocode_posts.pop(user_id, None)
 
     lines.append(f"\n📦 Всього у базі: <b>{total} шт.</b>")
 
     try:
-        await message.answer("\n".join(lines), reply_markup=get_main_keyboard())
+        if nocode_items:
+            await message.answer(
+                "\n".join(lines),
+                reply_markup=get_nocode_inline_keyboard(len(nocode_items)),
+            )
+        else:
+            await message.answer("\n".join(lines), reply_markup=get_main_keyboard())
     except Exception:
         logging.exception("Помилка відправки звіту про імпорт")
+
+
+@dp.callback_query(F.data == "show_nocode_posts")
+async def on_show_nocode_posts(callback: CallbackQuery):
+    uid = callback.from_user.id
+    items = last_nocode_posts.pop(uid, None)
+    if not items:
+        await callback.answer("Немає збережених постів без штрихкоду.", show_alert=True)
+        return
+
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+
+    await callback.message.answer(f"📤 Надсилаю пости без штрихкоду ({len(items)} шт.):")
+    for item in items:
+        raw_cap = item["caption"]
+        caption = esc(raw_cap) if raw_cap else "<i>(Без підпису)</i>"
+        await send_post(uid, item["photo"], caption, raw_prefill=raw_cap)
+        await asyncio.sleep(0.3)
+
+    await callback.message.answer(
+        "✅ Усі пости без штрихкоду надіслано вище.\n"
+        "Натисніть «✏️ Редагувати» під постом — бот надішле готовий текст, який можна скопіювати одним дотиком і дописати код (або відразу впишіть рядок <code>Код 123456...</code>, щоб бот сам додав його в опис і зберіг у базу!).",
+        reply_markup=get_main_keyboard(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +558,8 @@ def apply_promo_logic(caption: str, promo_header: str, discount_percent: float) 
     return remove_code_line(text)
 
 
-async def send_post(chat_id: int, photo: str, caption: str):
+async def send_post(chat_id: int, photo: str, caption: str, raw_prefill: str = ""):
+    kb = get_edit_inline_keyboard(raw_prefill)
     for _ in range(3):
         try:
             if len(caption) <= CAPTION_LIMIT:
@@ -494,13 +567,13 @@ async def send_post(chat_id: int, photo: str, caption: str):
                     chat_id=chat_id,
                     photo=photo,
                     caption=caption,
-                    reply_markup=get_edit_inline_keyboard(),
+                    reply_markup=kb,
                 )
             else:
                 msg = await bot.send_photo(
                     chat_id=chat_id,
                     photo=photo,
-                    reply_markup=get_edit_inline_keyboard(),
+                    reply_markup=kb,
                 )
                 try:
                     await bot.send_message(
@@ -661,7 +734,7 @@ async def auto_collect_posts(message: Message, state: FSMContext):
 
     if uid_int in _import_tasks:
         _import_tasks[uid_int].cancel()
-    
+
     _import_tasks[uid_int] = asyncio.create_task(_process_queue(uid_int, message))
 
 
@@ -783,36 +856,82 @@ async def finish_promo_batch(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "edit_caption")
 async def on_edit_caption(callback: CallbackQuery, state: FSMContext):
     msg = callback.message
-    if msg is None or msg.caption is None:
+    if msg is None or not msg.photo:
         await callback.answer("Це повідомлення не можна редагувати.", show_alert=True)
         return
+
+    old_caption = msg.caption or ""
+    if old_caption == "(Без підпису)":
+        old_caption = ""
+    photo_id = msg.photo[-1].file_id
 
     await state.set_state(AdminStates.waiting_for_edit_caption)
     await state.update_data(
         edit_chat_id=msg.chat.id,
         edit_message_id=msg.message_id,
-        edit_old_caption=msg.caption,
+        edit_old_caption=old_caption,
+        edit_photo_id=photo_id,
     )
     await callback.answer()
-    await callback.message.answer(
-        "✏️ Надішліть новий текст для цього поста.\n"
-        "Можна використовувати HTML-теги: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, <code>&lt;s&gt;</code>.\n\n"
-        "Або натисніть кнопку нижче, щоб скасувати.",
-        reply_markup=get_edit_cancel_keyboard(),
-    )
+
+    if old_caption:
+        await callback.message.answer(
+            "✏️ <b>Поточний текст поста</b> (натисніть на блок нижче, щоб скопіювати, вставте в поле вводу й допишіть код):\n\n"
+            f"<pre>{esc(old_caption)}</pre>\n"
+            "💡 <b>Швидкий спосіб:</b> якщо потрібно лише додати код до цього опису — просто надішліть <code>Код 1000287002666</code> (або самі цифри коду), і я автоматично вставлю його в текст і збережу пост в базу!",
+            reply_markup=get_edit_cancel_keyboard(),
+        )
+    else:
+        await callback.message.answer(
+            "✏️ У цього поста поки немає підпису. Надішліть новий текст для нього (наприклад, з рядком <code>Код 1000287002666</code>):",
+            reply_markup=get_edit_cancel_keyboard(),
+        )
+
+
+def _insert_code_into_caption(old_caption: str, code_input: str) -> str:
+    """Акуратно вставляє рядок 'Код XXXXX' у текст поста (перед рядком Ціна, якщо він є)."""
+    digits = normalize_code(code_input)
+    code_line = f"Код {digits}"
+    if not old_caption:
+        return code_line
+
+    lines = old_caption.splitlines()
+    for i, line in enumerate(lines):
+        if re.search(r"ціна", line, re.IGNORECASE):
+            # Вставляємо одразу перед Ціною (прибираючи зайвий порожній рядок між кодом і ціною, якщо треба)
+            lines.insert(i, code_line)
+            return "\n".join(lines)
+
+    return f"{old_caption.rstrip()}\n{code_line}"
 
 
 @dp.message(AdminStates.waiting_for_edit_caption, F.text)
 async def save_edited_caption(message: Message, state: FSMContext):
+    uid = message.from_user.id
     data = await state.get_data()
     chat_id = data.get("edit_chat_id")
     message_id = data.get("edit_message_id")
-    new_caption = message.text.strip()
+    old_caption = data.get("edit_old_caption") or ""
+    photo_id = data.get("edit_photo_id")
+
+    # Прибираємо можливе згадування @bot_username на початку, якщо користувач скористався switch_inline_query_current_chat
+    raw_input = re.sub(r"^@\w+\s*", "", message.text).strip()
     await state.clear()
 
     if not chat_id or not message_id:
         await message.answer("❌ Помилка сесії редагування. Спробуйте ще раз.", reply_markup=get_main_keyboard())
         return
+
+    # Перевіряємо: користувач надіслав лише код (наприклад "Код 100012345" або "100012345") чи повний текст?
+    is_only_code = bool(
+        re.fullmatch(r"(?:(?:штрихкод|код)[ \t]*[:\-]?[ \t]*)?\d[\d ]*", raw_input, re.IGNORECASE)
+        and len(normalize_code(raw_input)) >= MIN_CODE_LEN
+    )
+
+    if is_only_code and old_caption:
+        new_caption = _insert_code_into_caption(old_caption, raw_input)
+    else:
+        new_caption = raw_input
 
     try:
         await bot.edit_message_caption(
@@ -822,7 +941,6 @@ async def save_edited_caption(message: Message, state: FSMContext):
             parse_mode=ParseMode.HTML,
             reply_markup=get_edit_inline_keyboard(),
         )
-        await message.answer("✅ Підпис до поста успішно оновлено!", reply_markup=get_main_keyboard())
     except TelegramAPIError as e:
         logging.error(f"Помилка редагування caption: {e}")
         await message.answer(
@@ -830,6 +948,22 @@ async def save_edited_caption(message: Message, state: FSMContext):
             "Можливо, текст занадто довгий або містить невалідні HTML-теги.",
             reply_markup=get_main_keyboard(),
         )
+        return
+
+    # Якщо у новому підписі є валідний штрихкод і відоме фото — автоматично зберігаємо товар у базу!
+    plain_caption = re.sub(r"<[^>]+>", "", new_caption)
+    code = extract_code_from_text(plain_caption)
+    if code and photo_id:
+        is_update = db.upsert_post(uid, code, photo_id, plain_caption)
+        total = get_user_total_count(uid)
+        action_word = "оновлено в базі" if is_update else "додано в базу"
+        await message.answer(
+            f"✅ Підпис оновлено, а товар з кодом <code>{code}</code> автоматично {action_word}!\n"
+            f"📦 Всього у базі: <b>{total} шт.</b>",
+            reply_markup=get_main_keyboard(),
+        )
+    else:
+        await message.answer("✅ Підпис до поста успішно оновлено!", reply_markup=get_main_keyboard())
 
 
 @dp.message(
