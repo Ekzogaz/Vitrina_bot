@@ -327,7 +327,7 @@ def get_edit_inline_keyboard():
 
 
 # ---------------------------------------------------------------------------
-# Надежная очередь для массового сохранения постів без втрат
+# Надійна черга для масового збереження постів без втрат
 # ---------------------------------------------------------------------------
 _import_queues: dict[int, list] = {}
 _import_tasks: dict[int, asyncio.Task] = {}
@@ -343,7 +343,7 @@ async def _process_queue(user_id: int, message: Message):
 
     added = 0
     updated = 0
-    nocode = 0
+    nocode_samples = []
 
     for item in queue:
         caption = item["caption"]
@@ -357,17 +357,24 @@ async def _process_queue(user_id: int, message: Message):
             else:
                 added += 1
         else:
-            nocode += 1
+            snippet = caption.replace("\n", " ")[:30] + "..." if caption else "Без підпису"
+            nocode_samples.append(esc(snippet))
 
     total = get_user_total_count(user_id)
-    lines = []
-    if added:
-        lines.append(f"✅ Додано нових товарів: <b>{added}</b>")
-    if updated:
-        lines.append(f"🔄 Оновлено в базі: <b>{updated}</b>")
-    if nocode:
-        lines.append(f"ℹ️ Без штрихкоду (пропущено): <b>{nocode}</b>")
-    lines.append(f"📦 Всього у базі: <b>{total} шт.</b>")
+    lines = [
+        "📊 <b>Результат масового імпорту:</b>",
+        f"• Додано нових товарів: <b>{added}</b>",
+        f"• Оновлено в базі: <b>{updated}</b>"
+    ]
+    
+    if nocode_samples:
+        lines.append(f"• ℹ️ <b>Без штрихкоду (не додано): {len(nocode_samples)} шт.</b>")
+        preview = "\n".join([f"  – <code>{s}</code>" for s in nocode_samples[:5]])
+        lines.append(f"Приклади проблемних постів:\n{preview}")
+        if len(nocode_samples) > 5:
+            lines.append(f"<i>(та ще {len(nocode_samples) - 5} постів)</i>")
+
+    lines.append(f"\n📦 Всього у базі: <b>{total} шт.</b>")
 
     try:
         await message.answer("\n".join(lines), reply_markup=get_main_keyboard())
@@ -608,7 +615,7 @@ async def cmd_start(message: Message, state: FSMContext):
     promo_batches.pop(uid, None)
     s = get_user_settings(uid)
     await message.answer(
-        "Привіт! 👋 Я ваш персональний помічник для роботи з каталогом.\n\n"
+        "Привіт! 👋 Я ваш персональний помічник для роботи з Вітриною.\n\n"
         f"📋 Ваші поточні налаштування:\n"
         f"• Акція: {esc(s['promo'])}\n"
         f"• Знижка: {s['discount']:g}%\n\n"
