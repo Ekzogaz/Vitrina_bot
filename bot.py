@@ -443,6 +443,10 @@ async def _process_queue(user_id: int, message: Message):
         else:
             nocode_items.append({"photo": photo, "caption": caption})
 
+    # Если это группа, не захламляем чат отчетами с клавиатурами
+    if message.chat.type != "private":
+        return
+
     total = get_user_total_count(user_id)
     lines = [
         "📊 <b>Результат масового імпорту:</b>",
@@ -736,7 +740,6 @@ def parse_text_table(text: str) -> dict:
 
 
 def build_google_sheet_csv_url(raw_url: str) -> str:
-    """Превращает любую ссылку на Google Таблицу (включая gid конкретного листа) в прямую CSV-ссылку."""
     url = raw_url.strip()
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
     if not m:
@@ -778,6 +781,13 @@ def fetch_google_sheet_prices(raw_url: str) -> dict:
 # ---------------------------------------------------------------------------
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    if message.chat.type != "private":
+        await message.answer(
+            "👋 Привіт! Я бот-помічник для вітрини. Я автоматично збираю пости зі штрихкодами в базу даних.\n"
+            "Усі налаштування, акції, синхронізація з Google Таблицями та управління базою доступні **лише в особистих повідомленнях зі мною** 🔒."
+        )
+        return
+
     await state.clear()
     uid = message.from_user.id
     promo_batches.pop(uid, None)
@@ -798,6 +808,8 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @dp.message(F.text.in_({BTN_BACK, BTN_EDIT_CANCEL}))
 async def cancel_to_main_menu(message: Message, state: FSMContext):
+    if message.chat.type != "private":
+        return
     uid = message.from_user.id
     await state.clear()
     promo_batches.pop(uid, None)
@@ -837,6 +849,8 @@ async def auto_collect_posts(message: Message, state: FSMContext):
 
 @dp.message(F.text.in_(MENU_TEXTS))
 async def handle_menu_buttons(message: Message, state: FSMContext):
+    if message.chat.type != "private":
+        return
     uid_int = message.from_user.id
     text = message.text
     await state.clear()
